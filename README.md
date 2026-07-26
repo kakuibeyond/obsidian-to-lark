@@ -27,7 +27,7 @@
 
 - `lark-cli` 路径检测与保存
 - 飞书授权检测、授权、取消授权
-- `folder_token`
+- 默认上传位置（文件夹 token 或飞书云空间文件夹 URL；留空走根目录；暂不支持 Wiki 链接）
 - 最低授权 scopes
 - 是否忽略引用块
 - 是否将 SVG 转为 PNG
@@ -70,6 +70,7 @@ node tests/defaults-and-auth.test.js
 node tests/parse-markdown-blocks.test.js
 node tests/mermaid-whiteboard.test.js
 node tests/upload-target-selection.test.js
+node tests/upload-target-resolution.test.js
 node tests/svg-image-sizing.test.js
 node --check main.js
 node --check cli.js

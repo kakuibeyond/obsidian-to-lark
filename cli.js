@@ -21,7 +21,7 @@ const CLI_USAGE = [
 	'  --help                              Show this help message',
 	'  --title <title>                     Override the target doc title',
 	'  --lark-cli-path <path>              Override lark-cli executable path',
-	'  --folder-token <token>              Override target folder token',
+	'  --folder-token <token>              Override target folder token or Feishu drive folder URL',
 	'  --auto-create                       Auto create doc when missing',
 	'  --no-auto-create                    Require existing same-name doc',
 	'  --duplicate-strategy <mode>         overwrite | create_new',
@@ -177,7 +177,7 @@ async function runUploadFromCli(options = {}, dependencies = {}) {
 
 	const baseTitle = options.overrides?.targetTitle || path.parse(markdownPath).name;
 	logger.log(`[检查] 准备上传：${markdownPath}`);
-	logger.log(`[检查] folder_token：${settings.folderToken || '(未设置，默认根目录查重)'}`);
+	logger.log(`[检查] 上传位置：${uploader.folderToken || '(未设置，默认根目录查重)'}`);
 
 	const documents = await uploader.listTargetDocuments();
 	const duplicates = documents.filter((item) => item.title === baseTitle);

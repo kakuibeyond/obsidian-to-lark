@@ -1021,10 +1021,41 @@ async function completeAuthLogin(executablePath, deviceCode) {
 	return checkAuthStatus(executablePath);
 }
 
+const FEISHU_FOLDER_URL_PATTERN = /\/drive\/folder\/([A-Za-z0-9]+)/;
+
+// 把设置项里的「文件夹 token 或飞书云空间文件夹 URL」统一解析成纯 token。
+// 纯函数、无网络调用：URL 通过正则直接抽取 /drive/folder/<token> 段。
+// - 空 → ''（保持现状：上传/查重走飞书根目录）
+// - 非 URL → 原样返回（视为裸 token）
+// - 含 /wiki/ → 抛错（暂不支持 Wiki 链接）
+// - 匹配 /drive/folder/<token> → 返回该 token
+// - 其他 URL → 抛错（无法识别）
+function resolveFolderToken(rawValue) {
+	const value = String(rawValue || '').trim();
+	if (!value) {
+		return '';
+	}
+	if (!/^https?:\/\//i.test(value)) {
+		return value;
+	}
+	if (/\/wiki\//i.test(value)) {
+		throw new Error(
+			'暂不支持 Wiki 链接，请填写飞书文件夹 token 或云空间文件夹 URL（形如 https://xxx.feishu.cn/drive/folder/fldcnXXXX）。'
+		);
+	}
+	const match = value.match(FEISHU_FOLDER_URL_PATTERN);
+	if (match) {
+		return match[1];
+	}
+	throw new Error(
+		'无法识别的飞书链接，请确认是云空间文件夹 URL（形如 https://xxx.feishu.cn/drive/folder/fldcnXXXX）或直接填写文件夹 token。'
+	);
+}
+
 class LarkMarkdownUploader {
 	constructor(options) {
 		this.cliPath = options.cliPath;
-		this.folderToken = options.folderToken || '';
+		this.folderToken = resolveFolderToken(options.folderToken);
 		this.ignoreBlockquotes = options.ignoreBlockquotes === true;
 		this.convertSvgToRaster = options.convertSvgToRaster === true;
 		this.highlightToCallout = options.highlightToCallout !== false;
@@ -1780,7 +1811,6 @@ if (Plugin) {
 				this.appendLog('[检查] 正在检查 lark-cli...');
 				const cliInfo = await this.plugin.resolveCliForUpload();
 				this.appendLog(`[检查] lark-cli 可用：${cliInfo.path}${cliInfo.version ? ` (${cliInfo.version})` : ''}`);
-				this.appendLog(`[检查] folder_token：${this.plugin.settings.folderToken.trim() || '(未设置，默认根目录查重)'}`);
 
 				const uploader = new LarkMarkdownUploader({
 					cliPath: cliInfo.path,
@@ -1794,6 +1824,7 @@ if (Plugin) {
 					reportLog: (message) => this.appendLog(message),
 					reportProgress: (value) => this.setProgress(value)
 				});
+				this.appendLog(`[检查] 上传位置：${uploader.folderToken || '(未设置，默认根目录查重)'}`);
 
 				const title = path.parse(this.options.markdownPath).name;
 				let overwriteTarget = null;
@@ -2152,11 +2183,11 @@ if (Plugin) {
 				});
 
 			new Setting(containerEl)
-				.setName('默认 folder_token')
-				.setDesc('可选。留空时创建到飞书根目录；查重仅检查根目录。')
+				.setName('默认上传位置')
+				.setDesc('可选。可填写文件夹 token 或飞书云空间文件夹 URL（形如 https://xxx.feishu.cn/drive/folder/fldcnXXXX）；留空时上传到飞书根目录，查重仅检查根目录。暂不支持 Wiki 链接。')
 				.addText((text) => {
 					text
-						.setPlaceholder('fldcnxxxxxxxxxxxx')
+						.setPlaceholder('fldcnxxxx 或文件夹 URL')
 						.setValue(this.plugin.settings.folderToken)
 						.onChange(async (value) => {
 							this.plugin.settings.folderToken = value.trim();
@@ -2278,6 +2309,7 @@ module.exports.__testables = {
 	parseAuthStatusPayload,
 	formatAuthStatusMessage,
 	normalizeSettings,
+	resolveFolderToken,
 	normalizeMermaidColorTheme,
 	extractWhiteboardTokenFromMarkdown,
 	extractFetchedDocumentContent,

@@ -20,7 +20,7 @@
 
 - 检测并记录本机 `lark-cli` 路径
 - 发起飞书授权、展示当前授权状态、取消授权
-- 配置 `folder_token`
+- 配置默认上传位置（`folder_token`）：可填写文件夹 token 或飞书云空间文件夹 URL（形如 `https://xxx.feishu.cn/drive/folder/fldcnXXXX`）；留空走飞书根目录；暂不支持 Wiki 链接
 - 配置最低授权 scopes（`requiredAuthScopes`）
 - 配置以下上传行为：
   - 无同名飞书文档时是否自动创建
@@ -52,8 +52,9 @@
 ### 同名文档处理
 
 - 同名检测通过 `lark-cli drive files list` 完成
-- 配置了 `folder_token` 时，只在该目录下查重
-- 未配置 `folder_token` 时，只检查云盘根目录
+- 配置了上传位置时，只在该目录下查重
+- 未配置上传位置时，只检查云盘根目录
+- 上传位置接受文件夹 token 或飞书云空间文件夹 URL；URL 在构造 `LarkMarkdownUploader` 时由纯函数 `resolveFolderToken` 抽取 `fldcnXXXX`；Wiki 链接会抛错拦截
 - 命中同名文档时：
   - 可覆盖已有文档
   - 可新建后缀文档，如 `文档名 (1)`
@@ -87,5 +88,6 @@
   - `node tests/parse-markdown-blocks.test.js`
   - `node tests/mermaid-whiteboard.test.js`
   - `node tests/upload-target-selection.test.js`
+  - `node tests/upload-target-resolution.test.js`
   - `node tests/svg-image-sizing.test.js`
   - `node tests/cli-entry.test.js`
