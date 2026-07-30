@@ -93,6 +93,30 @@ const MARKDOWN_IMAGE_PATTERN = /!\[([^\]]*)\]\(([^\)]+)\)/g;
 const MERMAID_FENCE_PATTERN = /```mermaid[^\n]*\r?\n([\s\S]*?)```/gi;
 const SEARCHABLE_DOC_TYPES = new Set(['DOC', 'DOCX']);
 const IMAGE_SEARCH_SUBDIRS = ['attachments', 'images', 'assets', '附件'];
+// 图源工具导出图片时常见的文件名中缀，例如 diagram.drawio.png、sketch.excalidraw.png。
+// 当 Markdown 引用了带这类中缀的文件名，但实际导出文件没有中缀（diagram.png）时，用于兜底匹配。
+const KNOWN_IMAGE_SOURCE_EXTENSIONS = ['drawio', 'excalidraw', 'puml', 'plantuml', 'mmd', 'mermaid'];
+
+// 针对"图源中缀"文件名生成兜底候选：xxx.drawio.png → xxx.png。
+// 仅剥离紧邻最终扩展名、且属于已知图源工具的那一段中缀，避免误伤普通多扩展名文件。
+function buildImageFallbackFilenames(pureFilename) {
+	const name = String(pureFilename || '');
+	const lastDot = name.lastIndexOf('.');
+	if (lastDot <= 0) {
+		return [];
+	}
+	const ext = name.slice(lastDot);
+	const stem = name.slice(0, lastDot);
+	const secondDot = stem.lastIndexOf('.');
+	if (secondDot <= 0) {
+		return [];
+	}
+	const middle = stem.slice(secondDot + 1).toLowerCase();
+	if (!KNOWN_IMAGE_SOURCE_EXTENSIONS.includes(middle)) {
+		return [];
+	}
+	return [`${stem.slice(0, secondDot)}${ext}`];
+}
 const DEFAULT_LARK_IMAGE_WIDTH = 1200;
 const SVG_UPLOAD_RASTER_SCALE = 4;
 const MIN_SVG_UPLOAD_WIDTH = 4800;
@@ -734,6 +758,21 @@ function extractErrorMessage(error) {
 	return (candidates.find(Boolean) || '命令执行失败').trim();
 }
 
+// lark-cli 底层由 Go 二进制发起 HTTPS 请求。Go 1.24+ 默认拒绝 RSA 密钥 < 1024 位的
+// 证书（报 "certificate is using a broken key size"），而飞书部分 API 端点的证书链命中
+// 了该校验，会导致上传中断。这里为 lark-cli 子进程注入 GODEBUG 开关以恢复旧行为；
+// 用户已显式设置 GODEBUG 时在其后追加，已包含该开关时不重复，保留覆盖能力。
+function buildLarkCliEnv(baseEnv) {
+	const env = { ...baseEnv };
+	const existing = env.GODEBUG;
+	if (existing === undefined || existing === '') {
+		env.GODEBUG = 'x509usebrokenkeyscerts=1';
+	} else if (!/x509usebrokenkeyscerts=/.test(existing)) {
+		env.GODEBUG = `${existing},x509usebrokenkeyscerts=1`;
+	}
+	return env;
+}
+
 async function runCommand(command, args, options = {}) {
 	const invocation = await resolveCommandInvocation(command);
 	const finalArgs = [...invocation.argsPrefix, ...args];
@@ -743,6 +782,7 @@ async function runCommand(command, args, options = {}) {
 			encoding: 'utf8',
 			maxBuffer: 50 * 1024 * 1024,
 			cwd: options.cwd,
+			env: buildLarkCliEnv(process.env),
 			windowsHide: true
 		});
 	} catch (error) {
@@ -1258,6 +1298,29 @@ class LarkMarkdownUploader {
 		for (const candidate of candidates) {
 			if (fs.existsSync(candidate)) {
 				return candidate;
+			}
+		}
+
+		// 兜底：剥离图源工具中缀（如 xxx.drawio.png → xxx.png）后再扫一遍同样的目录集合。
+		// 仅在精确匹配全部失败时启用，不影响原有定位优先级。
+		const fallbackNames = buildImageFallbackFilenames(pureFilename);
+		if (fallbackNames.length > 0) {
+			const fallbackDirs = [markdownDir];
+			for (const subdir of IMAGE_SEARCH_SUBDIRS) {
+				fallbackDirs.push(path.resolve(markdownDir, subdir));
+			}
+			if (vaultRoot) {
+				for (const subdir of IMAGE_SEARCH_SUBDIRS) {
+					fallbackDirs.push(path.resolve(vaultRoot, subdir));
+				}
+			}
+			for (const dir of fallbackDirs) {
+				for (const fallbackName of fallbackNames) {
+					const candidate = path.resolve(dir, fallbackName);
+					if (fs.existsSync(candidate)) {
+						return candidate;
+					}
+				}
 			}
 		}
 
@@ -2327,5 +2390,7 @@ module.exports.__testables = {
 	restoreCodeBlocks,
 	extractSvgDimensions,
 	parseObsidianImageSizeHint,
-	getSvgRasterUploadSize
+	getSvgRasterUploadSize,
+	buildImageFallbackFilenames,
+	buildLarkCliEnv
 };

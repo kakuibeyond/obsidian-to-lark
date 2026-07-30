@@ -38,6 +38,7 @@
   - 当前目录
   - `attachments` / `images` / `assets` / `附件`
   - vault 根目录下的同名资源子目录
+  - 精确匹配失败时，按图源中缀剥离兜底（如 `xxx.drawio.png` → `xxx.png`），覆盖 drawio/excalidraw/puml/plantuml/mmd/mermaid
 - 支持图文混排顺序写入飞书文档
 - 支持 Mermaid 代码块转飞书文档内嵌画板，并按顺序插入
 - 支持 SVG 转 PNG 后上传
@@ -78,6 +79,7 @@
 - 文档内容写入使用临时 Markdown 文件，并以相对路径传给 `lark-cli`，兼容其 `@file` 限制。
 - Mermaid 代码块直接通过 Docs API v2 的 Markdown 写入，由 `lark-cli` 原生转换为 `type="mermaid"` 的飞书画板。
 - `data.json` 是本地运行时配置文件，首次运行会由代码默认值自动生成；它包含本机路径、授权状态等个人信息，不应提交到 Git。
+- `runCommand` 为 lark-cli 子进程注入 `GODEBUG=x509usebrokenkeyscerts=1`（由纯函数 `buildLarkCliEnv` 构建），规避 Go 1.24+ 拒绝飞书小密钥 RSA 证书（`certificate is using a broken key size`）导致的 TLS 中断；用户已显式设置 `GODEBUG` 时追加、已含则不重复。
 
 ## 发布前注意
 
@@ -91,3 +93,5 @@
   - `node tests/upload-target-resolution.test.js`
   - `node tests/svg-image-sizing.test.js`
   - `node tests/cli-entry.test.js`
+  - `node tests/image-fallback.test.js`
+  - `node tests/lark-cli-env.test.js`
