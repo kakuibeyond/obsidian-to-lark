@@ -16,6 +16,7 @@ const execFileAsync = promisify(execFile);
 const DEFAULT_SETTINGS = {
 	larkCliPath: '',
 	folderToken: '',
+	folderHistory: [],
 	lastCheckMessage: '',
 	lastAuthMessage: '',
 	autoCreateDocWhenMissing: false,
@@ -52,6 +53,27 @@ function normalizeSettings(rawSettings) {
 
 	if (merged.requiredAuthScopes.length === 0) {
 		merged.requiredAuthScopes = [...DEFAULT_SETTINGS.requiredAuthScopes];
+	}
+
+	// 上传位置：URL 统一收敛成裸 token，历史列表去重排序；
+	// 存量配置里已有的上传位置自动补进历史，避免升级后历史为空。
+	const resolvedFolderToken = safeResolveFolderToken(merged.folderToken);
+	if (resolvedFolderToken) {
+		merged.folderToken = resolvedFolderToken;
+	} else {
+		merged.folderToken = String(merged.folderToken || '').trim();
+	}
+
+	merged.folderHistory = normalizeFolderHistory(merged.folderHistory);
+	if (
+		resolvedFolderToken &&
+		!merged.folderHistory.some((item) => item.token === resolvedFolderToken)
+	) {
+		merged.folderHistory = upsertFolderHistoryEntry(merged.folderHistory, {
+			token: resolvedFolderToken,
+			name: '',
+			lastUsedAt: 0
+		});
 	}
 
 	return merged;
@@ -326,6 +348,43 @@ function prepareTextBlockContent(content, options = {}) {
 
 function hasMeaningfulMarkdown(content) {
 	return String(content || '').trim().length > 0;
+}
+
+// 把文档标题以 `<title>...</title>` 形式前置到 markdown 正文。lark-cli 在 +create / +update
+// overwrite 时都会识别该标记并让它「优先于」正文里的一级标题，从而让飞书文档标题等于文件名，
+// 而不是被正文首个 `# 一级标题` 顶替。注意 content 走的是 markdown 格式，标题文本需做基础 XML 转义。
+function escapeXmlText(value) {
+	return String(value || '')
+		.replace(/&/g, '&amp;')
+		.replace(/</g, '&lt;')
+		.replace(/>/g, '&gt;');
+}
+
+function withDocumentTitle(markdown, title) {
+	return `<title>${escapeXmlText(title)}</title>\n${markdown}`;
+}
+
+// 把相邻（中间没有被图片/Mermaid 隔开）的文本块合并成一个，减少 appendText 子进程调用次数。
+// 合并时直接拼接各块原文（它们原本就是被顺序 append 的，newline 已包含在块内容里），不额外插入分隔符，
+// 以忠实还原原先逐块追加的渲染效果。空白文本块直接丢弃，等价于上传循环里 hasMeaningfulMarkdown 的跳过逻辑。
+function mergeAdjacentTextBlocks(blocks) {
+	const merged = [];
+	for (const block of (blocks || [])) {
+		if (block.type !== 'text') {
+			merged.push({ ...block });
+			continue;
+		}
+		if (!hasMeaningfulMarkdown(block.content)) {
+			continue;
+		}
+		const last = merged[merged.length - 1];
+		if (last && last.type === 'text') {
+			last.content += block.content;
+		} else {
+			merged.push({ type: 'text', content: block.content });
+		}
+	}
+	return merged;
 }
 
 function buildDuplicateDocumentTitle(title, existingTitles = []) {
@@ -685,24 +744,43 @@ function readFirstLine(filePath) {
 	}
 }
 
+// 解析后的命令调用结果按命令字符串缓存：lark-cli 本质是个 Node 包装脚本，每次
+// runCommand 若都重跑 PATH 扫描（getAbsolutePath）+ 同步读整个脚本首行（readFirstLine），
+// 几十次上传调用会放大成几十次重复开销。cliPath / node 路径在运行期内稳定，缓存即可；
+// 设置变更（cliPath 改变）会让命令字符串本身变化从而自动换 key，另有 clearInvocationCache 在保存设置时兜底清空。
+const invocationCache = new Map();
+
 async function resolveCommandInvocation(command) {
+	const cached = invocationCache.get(command);
+	if (cached) {
+		return cached;
+	}
+
 	const resolvedCommand = await getAbsolutePath(command);
 	const firstLine = readFirstLine(resolvedCommand);
 
+	let invocation;
 	if (/^#!.*\bnode\b/i.test(firstLine)) {
 		const nodePath = await getAbsolutePath('node');
-		return {
+		invocation = {
 			command: nodePath,
 			argsPrefix: [resolvedCommand],
 			resolvedCommand
 		};
+	} else {
+		invocation = {
+			command: resolvedCommand,
+			argsPrefix: [],
+			resolvedCommand
+		};
 	}
 
-	return {
-		command: resolvedCommand,
-		argsPrefix: [],
-		resolvedCommand
-	};
+	invocationCache.set(command, invocation);
+	return invocation;
+}
+
+function clearInvocationCache() {
+	invocationCache.clear();
 }
 
 function extractTrailingJson(text) {
@@ -1092,6 +1170,236 @@ function resolveFolderToken(rawValue) {
 	);
 }
 
+// 解析失败时退化为空（即根目录），用于设置页展示等不应中断的场景。
+function safeResolveFolderToken(rawValue) {
+	try {
+		return resolveFolderToken(rawValue);
+	} catch (_error) {
+		return '';
+	}
+}
+
+const MAX_FOLDER_HISTORY = 20;
+const ROOT_FOLDER_LABEL = '我的空间（根目录）';
+const ADD_FOLDER_OPTION_VALUE = '__add_new_folder__';
+
+function shortenFolderToken(token) {
+	const value = String(token || '');
+	if (value.length <= 14) {
+		return value;
+	}
+	return `${value.slice(0, 12)}…`;
+}
+
+function normalizeFolderHistoryEntry(raw) {
+	if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+		return null;
+	}
+
+	const token = String(raw.token || '').trim();
+	if (!token) {
+		return null;
+	}
+
+	const lastUsedAt = Number(raw.lastUsedAt);
+
+	return {
+		token,
+		name: String(raw.name || '').trim(),
+		lastUsedAt: Number.isFinite(lastUsedAt) && lastUsedAt > 0 ? Math.floor(lastUsedAt) : 0
+	};
+}
+
+// 历史上传位置：按 token 去重（名称与最近使用时间取更有信息量的一方），
+// 按最近使用时间倒序，最多保留 MAX_FOLDER_HISTORY 条。
+function normalizeFolderHistory(rawList) {
+	const list = Array.isArray(rawList) ? rawList : [];
+	const byToken = new Map();
+
+	for (const raw of list) {
+		const entry = normalizeFolderHistoryEntry(raw);
+		if (!entry) {
+			continue;
+		}
+
+		const existing = byToken.get(entry.token);
+		if (!existing) {
+			byToken.set(entry.token, entry);
+			continue;
+		}
+
+		byToken.set(entry.token, {
+			token: entry.token,
+			name: entry.name || existing.name,
+			lastUsedAt: Math.max(existing.lastUsedAt, entry.lastUsedAt)
+		});
+	}
+
+	return Array.from(byToken.values())
+		.sort((left, right) => right.lastUsedAt - left.lastUsedAt)
+		.slice(0, MAX_FOLDER_HISTORY);
+}
+
+// 新增或更新一条历史：名称为空时保留原有名称（避免刷新失败把备注抹掉）。
+function upsertFolderHistoryEntry(list, entry) {
+	const normalized = normalizeFolderHistoryEntry(entry);
+	const current = normalizeFolderHistory(list);
+
+	if (!normalized) {
+		return current;
+	}
+
+	const existing = current.find((item) => item.token === normalized.token);
+	const merged = existing
+		? {
+			token: normalized.token,
+			name: normalized.name || existing.name,
+			lastUsedAt: Math.max(normalized.lastUsedAt, existing.lastUsedAt)
+		}
+		: normalized;
+
+	return normalizeFolderHistory([
+		merged,
+		...current.filter((item) => item.token !== normalized.token)
+	]);
+}
+
+function removeFolderHistoryEntry(list, token) {
+	const target = String(token || '').trim();
+	return normalizeFolderHistory(list).filter((item) => item.token !== target);
+}
+
+// 重命名允许清空（清空后回落到 token 展示）。
+function renameFolderHistoryEntry(list, token, name) {
+	const target = String(token || '').trim();
+	const nextName = String(name || '').trim();
+
+	return normalizeFolderHistory(list).map((item) => (
+		item.token === target
+			? { token: item.token, name: nextName, lastUsedAt: item.lastUsedAt }
+			: item
+	));
+}
+
+function formatFolderHistoryLabel(entry) {
+	const normalized = normalizeFolderHistoryEntry(entry);
+	if (!normalized) {
+		return ROOT_FOLDER_LABEL;
+	}
+
+	return normalized.name
+		? `${normalized.name}（${shortenFolderToken(normalized.token)}）`
+		: normalized.token;
+}
+
+// 下拉选项：根目录固定第一项；当前生效位置若不在历史里，补一条临时项避免选中态丢失。
+function buildFolderOptions(history, currentToken) {
+	const list = normalizeFolderHistory(history);
+	const current = String(currentToken || '').trim();
+	const options = [{ value: '', label: ROOT_FOLDER_LABEL }];
+
+	for (const entry of list) {
+		options.push({ value: entry.token, label: formatFolderHistoryLabel(entry) });
+	}
+
+	if (current && !list.some((item) => item.token === current)) {
+		options.push({ value: current, label: `${shortenFolderToken(current)}（未加入历史）` });
+	}
+
+	return options;
+}
+
+function describeFolderTarget(history, token) {
+	const target = String(token || '').trim();
+	if (!target) {
+		return ROOT_FOLDER_LABEL;
+	}
+
+	const entry = normalizeFolderHistory(history).find((item) => item.token === target);
+	return entry ? formatFolderHistoryLabel(entry) : target;
+}
+
+// 解析 `drive +inspect` 输出。注意：token 不存在时 lark-cli 仍返回 ok:true 但 title 为空，
+// 因此这里只负责解析，可用性交给 assertFolderAccessible 兜底校验。
+function parseFolderInspectPayload(payload) {
+	const root = payload && typeof payload === 'object' ? payload : {};
+
+	if (root.ok === false) {
+		throw new Error(root.error?.message || '飞书接口调用失败，无法解析文件夹信息。');
+	}
+
+	const data = root.data && typeof root.data === 'object' ? root.data : root;
+	const type = String(data.type || '').trim().toLowerCase();
+
+	if (type && type !== 'folder') {
+		throw new Error(`目标不是云空间文件夹（识别为 ${type}），请填写文件夹 URL 或文件夹 token。`);
+	}
+
+	const token = String(data.token || '').trim();
+	if (!token) {
+		throw new Error('未能解析出文件夹 token，请确认填写的是云空间文件夹 URL 或 token。');
+	}
+
+	return { token, name: String(data.title || '').trim() };
+}
+
+const FOLDER_ACCESS_HINT = '请确认文件夹 token / URL 正确，且当前授权账号有访问权限。';
+
+async function assertFolderAccessible(cliPath, token) {
+	let stdout = '';
+
+	try {
+		({ stdout } = await runCommand(cliPath, [
+			'drive',
+			'files',
+			'list',
+			'--as',
+			'user',
+			'--params',
+			JSON.stringify({ folder_token: token, page_size: 1 })
+		]));
+	} catch (error) {
+		throw new Error(`无法访问该文件夹（${extractErrorMessage(error)}）。${FOLDER_ACCESS_HINT}`);
+	}
+
+	const payload = extractTrailingJson(stdout) || {};
+	if (payload.ok === false) {
+		const detail = payload.error?.message ? `（${payload.error.message}）` : '';
+		throw new Error(`无法访问该文件夹${detail}。${FOLDER_ACCESS_HINT}`);
+	}
+}
+
+// 取文件夹名称：优先 inspect 的 title；title 为空说明 token 可能无效，再用文件列表兜底校验。
+async function fetchFolderMeta(cliPath, rawValue) {
+	const raw = String(rawValue || '').trim();
+	const token = resolveFolderToken(raw);
+
+	if (!token) {
+		return { token: '', name: ROOT_FOLDER_LABEL };
+	}
+
+	const args = ['drive', '+inspect', '--as', 'user', '--url', raw, '--json'];
+	if (!/^https?:\/\//i.test(raw)) {
+		args.push('--type', 'folder');
+	}
+
+	let stdout = '';
+	try {
+		({ stdout } = await runCommand(cliPath, args));
+	} catch (error) {
+		throw new Error(`解析文件夹信息失败（${extractErrorMessage(error)}）。${FOLDER_ACCESS_HINT}`);
+	}
+
+	const meta = parseFolderInspectPayload(extractTrailingJson(stdout) || {});
+	const resolvedToken = meta.token || token;
+
+	if (!meta.name) {
+		await assertFolderAccessible(cliPath, resolvedToken);
+	}
+
+	return { token: resolvedToken, name: meta.name };
+}
+
 class LarkMarkdownUploader {
 	constructor(options) {
 		this.cliPath = options.cliPath;
@@ -1364,6 +1672,9 @@ class LarkMarkdownUploader {
 	}
 
 	async overwriteDocument(docRef, title, markdown) {
+		// +update 没有 --title 参数，而飞书导入会把正文首个一级标题当成文档标题。
+		// 这里把文件名以 <title> 标记前置到正文，使其优先于一级标题（与 +create 的 --title 行为一致）。
+		const content = withDocumentTitle(markdown, title);
 		await runMarkdownCommand(this.cliPath, [
 			'docs',
 			'+update',
@@ -1375,7 +1686,7 @@ class LarkMarkdownUploader {
 			'overwrite',
 			'--api-version',
 			'v2'
-		], markdown);
+		], content);
 	}
 
 	async appendText(docRef, text) {
@@ -1706,14 +2017,17 @@ class LarkMarkdownUploader {
 		const rawContent = await fs.promises.readFile(markdownPath, 'utf8');
 		const afterBlockquote = this.ignoreBlockquotes ? stripBlockquotes(rawContent) : rawContent;
 		const content = trimCodeBlockTrailingNewlines(afterBlockquote);
-		const blocks = this.parseMarkdownBlocks(content);
+		const parsedBlocks = this.parseMarkdownBlocks(content);
 
-		for (const block of blocks) {
+		for (const block of parsedBlocks) {
 			if (block.type !== 'text') {
 				continue;
 			}
 			block.content = prepareTextBlockContent(block.content, this);
 		}
+
+		// 合并相邻文本块，减少 appendText 子进程调用（图片/Mermaid 仍是天然边界，不会被合进文本）。
+		const blocks = mergeAdjacentTextBlocks(parsedBlocks);
 
 		const imageCount = blocks.filter((block) => block.type === 'image').length;
 		const mermaidCount = blocks.filter((block) => block.type === 'mermaid').length;
@@ -1772,13 +2086,20 @@ class LarkMarkdownUploader {
 }
 
 let ObsidianToLarkPlugin;
+// 以下两个 UI 类在 CLI 环境下不会被定义，导出后可在测试里用假 DOM 驱动。
+let UploadConfirmModal;
+let ObsidianToLarkSettingTab;
 
 if (Plugin) {
-	class SimpleConfirmModal extends Modal {
-		constructor(app, options) {
+	// 上传确认弹窗：顺手做本次上传的目标位置选择，避免为了换目录专门去设置页。
+	UploadConfirmModal = class UploadConfirmModal extends Modal {
+		constructor(app, plugin, options) {
 			super(app);
-			this.options = options;
+			this.plugin = plugin;
+			this.options = options || {};
 			this.resolved = false;
+			this.selectedToken = plugin.getCurrentFolderToken();
+			this.setAsDefault = false;
 			this.promise = new Promise((resolve) => {
 				this.resolvePromise = resolve;
 			});
@@ -1787,21 +2108,45 @@ if (Plugin) {
 		onOpen() {
 			const { contentEl } = this;
 			contentEl.empty();
-			contentEl.createEl('h3', { text: this.options.title });
-			if (this.options.message) {
-				contentEl.createEl('p', { text: this.options.message });
+			contentEl.createEl('h3', { text: '确认上传到飞书云文档' });
+			contentEl.createEl('p', { text: `当前文件：${this.options.markdownPath}` });
+
+			const targetRow = contentEl.createDiv({ cls: 'obsidian-to-lark-target-row' });
+			targetRow.createSpan({ cls: 'obsidian-to-lark-target-label', text: '上传到：' });
+
+			const select = targetRow.createEl('select', { cls: 'dropdown obsidian-to-lark-target-select' });
+			for (const option of buildFolderOptions(this.plugin.getFolderHistory(), this.selectedToken)) {
+				const optionEl = select.createEl('option', { text: option.label });
+				optionEl.value = option.value;
 			}
-			if (this.options.detail) {
-				contentEl.createEl('p', { text: this.options.detail });
-			}
+			select.value = this.selectedToken;
+			select.addEventListener('change', () => {
+				this.selectedToken = select.value;
+			});
+
+			const defaultRow = contentEl.createDiv({ cls: 'obsidian-to-lark-target-default' });
+			const checkbox = defaultRow.createEl('input', { type: 'checkbox' });
+			checkbox.id = 'obsidian-to-lark-set-default';
+			checkbox.addEventListener('change', () => {
+				this.setAsDefault = checkbox.checked;
+			});
+			const checkboxLabel = defaultRow.createEl('label', { text: '同时设为默认上传位置' });
+			checkboxLabel.htmlFor = checkbox.id;
+
+			contentEl.createDiv({
+				cls: 'obsidian-to-lark-target-hint',
+				text: '不勾选时，这里的选择只对本次上传生效；新增位置请到插件设置里添加。'
+			});
 
 			const buttonRow = contentEl.createDiv({ cls: 'obsidian-to-lark-actions' });
-			const confirmButton = buttonRow.createEl('button', { text: this.options.confirmText || '确认' });
+			const confirmButton = buttonRow.createEl('button', { text: '确认上传' });
 			confirmButton.addClass('mod-cta');
 			confirmButton.onclick = () => this.finish(true);
 
-			const cancelButton = buttonRow.createEl('button', { text: this.options.cancelText || '取消' });
+			const cancelButton = buttonRow.createEl('button', { text: '取消' });
 			cancelButton.onclick = () => this.finish(false);
+
+			confirmButton.focus();
 		}
 
 		onClose() {
@@ -1811,12 +2156,16 @@ if (Plugin) {
 			}
 		}
 
-		finish(result) {
+		finish(confirmed) {
 			if (this.resolved) {
 				return;
 			}
 			this.resolved = true;
-			this.resolvePromise(result);
+			this.resolvePromise({
+				confirmed,
+				folderToken: this.selectedToken,
+				setAsDefault: this.setAsDefault
+			});
 			this.close();
 		}
 
@@ -1824,7 +2173,7 @@ if (Plugin) {
 			this.open();
 			return this.promise;
 		}
-	}
+	};
 
 	class UploadLogModal extends Modal {
 		constructor(app, plugin, options) {
@@ -1875,9 +2224,13 @@ if (Plugin) {
 				const cliInfo = await this.plugin.resolveCliForUpload();
 				this.appendLog(`[检查] lark-cli 可用：${cliInfo.path}${cliInfo.version ? ` (${cliInfo.version})` : ''}`);
 
+				const targetFolderToken = typeof this.options.folderToken === 'string'
+					? this.options.folderToken
+					: this.plugin.settings.folderToken;
+
 				const uploader = new LarkMarkdownUploader({
 					cliPath: cliInfo.path,
-					folderToken: this.plugin.settings.folderToken.trim(),
+					folderToken: String(targetFolderToken || '').trim(),
 					ignoreBlockquotes: this.plugin.settings.ignoreBlockquotes,
 					convertSvgToRaster: this.plugin.settings.convertSvgToRaster,
 					highlightToCallout: this.plugin.settings.highlightToCallout,
@@ -1887,7 +2240,7 @@ if (Plugin) {
 					reportLog: (message) => this.appendLog(message),
 					reportProgress: (value) => this.setProgress(value)
 				});
-				this.appendLog(`[检查] 上传位置：${uploader.folderToken || '(未设置，默认根目录查重)'}`);
+				this.appendLog(`[检查] 上传位置：${this.plugin.describeFolder(uploader.folderToken)}`);
 
 				const title = path.parse(this.options.markdownPath).name;
 				let overwriteTarget = null;
@@ -1990,6 +2343,8 @@ if (Plugin) {
 
 		async saveSettings() {
 			this.settings = normalizeSettings(this.settings);
+			// 设置变更（含 cliPath）可能改变 lark-cli 解析结果，清空命令调用缓存以便下次重新解析。
+			clearInvocationCache();
 			await this.saveData(this.settings);
 		}
 
@@ -2002,6 +2357,108 @@ if (Plugin) {
 				? this.settings.requiredAuthScopes
 				: [];
 			return scopes.filter(Boolean);
+		}
+
+		getFolderHistory() {
+			return normalizeFolderHistory(this.settings.folderHistory);
+		}
+
+		getCurrentFolderToken() {
+			return safeResolveFolderToken(this.settings.folderToken);
+		}
+
+		describeFolder(token) {
+			return describeFolderTarget(this.settings.folderHistory, token);
+		}
+
+		async setCurrentFolder(token) {
+			const target = String(token || '').trim();
+			this.settings.folderToken = target;
+
+			if (target) {
+				this.settings.folderHistory = upsertFolderHistoryEntry(this.settings.folderHistory, {
+					token: target,
+					name: '',
+					lastUsedAt: Date.now()
+				});
+			}
+
+			await this.saveSettings();
+			return target;
+		}
+
+		async touchFolderUsage(token) {
+			const target = String(token || '').trim();
+			if (!target) {
+				return;
+			}
+
+			this.settings.folderHistory = upsertFolderHistoryEntry(this.settings.folderHistory, {
+				token: target,
+				name: '',
+				lastUsedAt: Date.now()
+			});
+			await this.saveSettings();
+		}
+
+		async addFolderToHistory(rawValue) {
+			const cliInfo = await this.resolveCliForUpload();
+			const meta = await fetchFolderMeta(cliInfo.path, rawValue);
+
+			if (!meta.token) {
+				this.settings.folderToken = '';
+				await this.saveSettings();
+				return meta;
+			}
+
+			this.settings.folderHistory = upsertFolderHistoryEntry(this.settings.folderHistory, {
+				token: meta.token,
+				name: meta.name,
+				lastUsedAt: Date.now()
+			});
+			this.settings.folderToken = meta.token;
+			await this.saveSettings();
+
+			return meta;
+		}
+
+		async refreshFolderName(token) {
+			const target = String(token || '').trim();
+			if (!target) {
+				return { token: '', name: ROOT_FOLDER_LABEL };
+			}
+
+			const cliInfo = await this.resolveCliForUpload();
+			const meta = await fetchFolderMeta(cliInfo.path, target);
+
+			if (meta.name) {
+				this.settings.folderHistory = renameFolderHistoryEntry(
+					this.settings.folderHistory,
+					target,
+					meta.name
+				);
+				await this.saveSettings();
+			}
+
+			return meta;
+		}
+
+		async renameFolder(token, name) {
+			this.settings.folderHistory = renameFolderHistoryEntry(this.settings.folderHistory, token, name);
+			await this.saveSettings();
+		}
+
+		async removeFolder(token) {
+			const target = String(token || '').trim();
+			this.settings.folderHistory = removeFolderHistoryEntry(this.settings.folderHistory, target);
+
+			const fellBackToRoot = this.getCurrentFolderToken() === target && target !== '';
+			if (fellBackToRoot) {
+				this.settings.folderToken = '';
+			}
+
+			await this.saveSettings();
+			return { fellBackToRoot };
 		}
 
 		async resolveCliForUpload() {
@@ -2131,26 +2588,32 @@ if (Plugin) {
 
 			try {
 				const markdownPath = this.resolveActiveMarkdownPath(file);
-				const confirmed = await new SimpleConfirmModal(this.app, {
-					title: '确认上传到飞书云文档',
-					message: `当前文件：${markdownPath}`,
-					confirmText: '确认上传',
-					cancelText: '取消'
+				const decision = await new UploadConfirmModal(this.app, this, {
+					markdownPath
 				}).waitForDecision();
 
-				if (!confirmed) {
+				if (!decision.confirmed) {
 					new Notice('已取消上传', 3000);
 					return;
 				}
 
-				new UploadLogModal(this.app, this, { markdownPath }).open();
+				if (decision.setAsDefault) {
+					await this.setCurrentFolder(decision.folderToken);
+				} else {
+					await this.touchFolderUsage(decision.folderToken);
+				}
+
+				new UploadLogModal(this.app, this, {
+					markdownPath,
+					folderToken: decision.folderToken
+				}).open();
 			} catch (error) {
 				new Notice(error.message || String(error), 6000);
 			}
 		}
 	};
 
-	class ObsidianToLarkSettingTab extends PluginSettingTab {
+	ObsidianToLarkSettingTab = class ObsidianToLarkSettingTab extends PluginSettingTab {
 		constructor(app, plugin) {
 			super(app, plugin);
 			this.plugin = plugin;
@@ -2245,18 +2708,7 @@ if (Plugin) {
 						});
 				});
 
-			new Setting(containerEl)
-				.setName('默认上传位置')
-				.setDesc('可选。可填写文件夹 token 或飞书云空间文件夹 URL（形如 https://xxx.feishu.cn/drive/folder/fldcnXXXX）；留空时上传到飞书根目录，查重仅检查根目录。暂不支持 Wiki 链接。')
-				.addText((text) => {
-					text
-						.setPlaceholder('fldcnxxxx 或文件夹 URL')
-						.setValue(this.plugin.settings.folderToken)
-						.onChange(async (value) => {
-							this.plugin.settings.folderToken = value.trim();
-							await this.plugin.saveSettings();
-						});
-				});
+			this.renderFolderSection(containerEl.createDiv({ cls: 'obsidian-to-lark-folder-section' }));
 
 			new Setting(containerEl)
 				.setName('无同名飞书文档时自动创建')
@@ -2356,7 +2808,177 @@ if (Plugin) {
 
 			updateCalloutSettingsVisibility();
 		}
-	}
+
+		// 上传位置区域会被局部重绘（避免整页 display() 重新拉授权状态）。
+		renderFolderSection(sectionEl) {
+			sectionEl.empty();
+
+			const currentToken = this.plugin.getCurrentFolderToken();
+			const history = this.plugin.getFolderHistory();
+			let addRowEl = null;
+			let addInputEl = null;
+
+			const showAddRow = (visible) => {
+				if (!addRowEl) {
+					return;
+				}
+				addRowEl.style.display = visible ? 'flex' : 'none';
+				if (visible && addInputEl) {
+					addInputEl.value = '';
+					addInputEl.focus();
+				}
+			};
+
+			new Setting(sectionEl)
+				.setName('默认上传位置')
+				.setDesc('从历史位置下拉切换，或手动添加新的文件夹 URL / token；留空即上传到飞书根目录（查重也只查根目录）。暂不支持 Wiki 链接。')
+				.addDropdown((dropdown) => {
+					for (const option of buildFolderOptions(history, currentToken)) {
+						dropdown.addOption(option.value, option.label);
+					}
+					dropdown.addOption(ADD_FOLDER_OPTION_VALUE, '＋ 添加新位置…');
+					dropdown.setValue(currentToken);
+					dropdown.onChange(async (value) => {
+						if (value === ADD_FOLDER_OPTION_VALUE) {
+							dropdown.setValue(currentToken);
+							showAddRow(true);
+							return;
+						}
+
+						await this.plugin.setCurrentFolder(value);
+						new Notice(`默认上传位置：${this.plugin.describeFolder(value)}`, 4000);
+						this.renderFolderSection(sectionEl);
+					});
+				})
+				.addButton((button) => {
+					button.setButtonText('＋ 新增').onClick(() => showAddRow(true));
+				});
+
+			addRowEl = sectionEl.createDiv({ cls: 'obsidian-to-lark-folder-add' });
+			addRowEl.style.display = 'none';
+			addInputEl = addRowEl.createEl('input', {
+				type: 'text',
+				cls: 'obsidian-to-lark-folder-input'
+			});
+			addInputEl.placeholder = 'https://xxx.feishu.cn/drive/folder/fldcnXXXX 或 fldcnXXXX';
+
+			const confirmButton = addRowEl.createEl('button', { text: '校验并添加' });
+			confirmButton.addClass('mod-cta');
+			const cancelButton = addRowEl.createEl('button', { text: '取消' });
+			cancelButton.onclick = () => showAddRow(false);
+
+			const submitNewFolder = async () => {
+				const raw = addInputEl.value.trim();
+				if (!raw) {
+					new Notice('请先填写文件夹 URL 或 token。', 4000);
+					return;
+				}
+
+				confirmButton.disabled = true;
+				confirmButton.textContent = '校验中…';
+
+				try {
+					const meta = await this.plugin.addFolderToHistory(raw);
+					new Notice(
+						meta.name
+							? `已添加并切换到「${meta.name}」`
+							: '已添加并切换到该文件夹（未取到名称，可在下方手动备注）',
+						5000
+					);
+					this.renderFolderSection(sectionEl);
+				} catch (error) {
+					new Notice(extractErrorMessage(error), 7000);
+					confirmButton.disabled = false;
+					confirmButton.textContent = '校验并添加';
+				}
+			};
+
+			confirmButton.onclick = () => {
+				void submitNewFolder();
+			};
+			addInputEl.addEventListener('keydown', (event) => {
+				if (event.key === 'Enter') {
+					event.preventDefault();
+					void submitNewFolder();
+				}
+			});
+
+			const listEl = sectionEl.createDiv({ cls: 'obsidian-to-lark-folder-list' });
+
+			if (history.length === 0) {
+				listEl.createDiv({
+					cls: 'obsidian-to-lark-folder-empty',
+					text: '还没有历史位置。点「＋ 新增」粘贴飞书文件夹链接，之后就能在上面的下拉里一键切换。'
+				});
+				return;
+			}
+
+			listEl.createDiv({
+				cls: 'obsidian-to-lark-folder-list-title',
+				text: `历史上传位置（${history.length}）`
+			});
+
+			for (const entry of history) {
+				const row = listEl.createDiv({ cls: 'obsidian-to-lark-folder-row' });
+				const isCurrent = entry.token === currentToken;
+				if (isCurrent) {
+					row.addClass('is-current');
+				}
+
+				row.createSpan({
+					cls: 'obsidian-to-lark-folder-tag',
+					text: isCurrent ? '当前' : ''
+				});
+
+				const nameInput = row.createEl('input', {
+					type: 'text',
+					cls: 'obsidian-to-lark-folder-name'
+				});
+				nameInput.value = entry.name;
+				nameInput.placeholder = '未命名（可自定义备注）';
+				nameInput.addEventListener('change', async () => {
+					await this.plugin.renameFolder(entry.token, nameInput.value);
+					this.renderFolderSection(sectionEl);
+				});
+
+				row.createSpan({ cls: 'obsidian-to-lark-folder-token', text: entry.token });
+
+				const refreshButton = row.createEl('button', { text: '同步名称' });
+				refreshButton.onclick = async () => {
+					refreshButton.disabled = true;
+					refreshButton.textContent = '同步中…';
+
+					try {
+						const meta = await this.plugin.refreshFolderName(entry.token);
+						new Notice(
+							meta.name
+								? `已同步名称：${meta.name}`
+								: '飞书未返回该文件夹名称，可手动填写备注。',
+							5000
+						);
+						this.renderFolderSection(sectionEl);
+					} catch (error) {
+						new Notice(extractErrorMessage(error), 7000);
+						refreshButton.disabled = false;
+						refreshButton.textContent = '同步名称';
+					}
+				};
+
+				const removeButton = row.createEl('button', { text: '删除' });
+				removeButton.addClass('mod-warning');
+				removeButton.onclick = async () => {
+					const result = await this.plugin.removeFolder(entry.token);
+					new Notice(
+						result.fellBackToRoot
+							? '已删除，当前上传位置回落到根目录。'
+							: '已从历史中删除。',
+						4000
+					);
+					this.renderFolderSection(sectionEl);
+				};
+			}
+		}
+	};
 }
 
 module.exports = ObsidianToLarkPlugin || {};
@@ -2373,6 +2995,21 @@ module.exports.__testables = {
 	formatAuthStatusMessage,
 	normalizeSettings,
 	resolveFolderToken,
+	safeResolveFolderToken,
+	normalizeFolderHistoryEntry,
+	normalizeFolderHistory,
+	upsertFolderHistoryEntry,
+	removeFolderHistoryEntry,
+	renameFolderHistoryEntry,
+	formatFolderHistoryLabel,
+	buildFolderOptions,
+	describeFolderTarget,
+	parseFolderInspectPayload,
+	fetchFolderMeta,
+	UploadConfirmModal,
+	ObsidianToLarkSettingTab,
+	ROOT_FOLDER_LABEL,
+	MAX_FOLDER_HISTORY,
 	normalizeMermaidColorTheme,
 	extractWhiteboardTokenFromMarkdown,
 	extractFetchedDocumentContent,
@@ -2392,5 +3029,10 @@ module.exports.__testables = {
 	parseObsidianImageSizeHint,
 	getSvgRasterUploadSize,
 	buildImageFallbackFilenames,
-	buildLarkCliEnv
+	buildLarkCliEnv,
+	mergeAdjacentTextBlocks,
+	withDocumentTitle,
+	escapeXmlText,
+	clearInvocationCache,
+	resolveCommandInvocation
 };

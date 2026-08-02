@@ -43,3 +43,97 @@
 	width: 100%;
 	min-height: 72px;
 }
+
+.obsidian-to-lark-folder-add {
+	display: none;
+	align-items: center;
+	gap: 8px;
+	margin: 0 0 10px;
+}
+
+.obsidian-to-lark-folder-input {
+	flex: 1;
+	min-width: 240px;
+}
+
+.obsidian-to-lark-folder-list {
+	margin-bottom: 18px;
+	padding: 10px 12px;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 8px;
+	background: var(--background-secondary);
+}
+
+.obsidian-to-lark-folder-list-title {
+	margin-bottom: 8px;
+	font-size: 12px;
+	color: var(--text-muted);
+}
+
+.obsidian-to-lark-folder-empty {
+	font-size: 12px;
+	color: var(--text-muted);
+	line-height: 1.5;
+}
+
+.obsidian-to-lark-folder-row {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 4px 0;
+}
+
+.obsidian-to-lark-folder-tag {
+	flex: 0 0 32px;
+	font-size: 11px;
+	color: var(--text-accent);
+}
+
+.obsidian-to-lark-folder-row.is-current .obsidian-to-lark-folder-name {
+	border-color: var(--text-accent);
+}
+
+.obsidian-to-lark-folder-name {
+	flex: 0 0 180px;
+}
+
+.obsidian-to-lark-folder-token {
+	flex: 1;
+	overflow: hidden;
+	font-family: var(--font-monospace);
+	font-size: 11px;
+	color: var(--text-muted);
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.obsidian-to-lark-target-row {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	margin-top: 12px;
+}
+
+.obsidian-to-lark-target-label {
+	flex: 0 0 auto;
+	color: var(--text-muted);
+}
+
+.obsidian-to-lark-target-select {
+	flex: 1;
+	min-width: 0;
+}
+
+.obsidian-to-lark-target-default {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	margin-top: 10px;
+}
+
+.obsidian-to-lark-target-hint {
+	margin-top: 6px;
+	font-size: 12px;
+	color: var(--text-muted);
+	line-height: 1.5;
+}

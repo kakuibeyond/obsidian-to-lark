@@ -7,7 +7,8 @@ const pluginModule = require('./main.js');
 const {
 	LarkMarkdownUploader,
 	normalizeSettings,
-	planUploadTarget
+	planUploadTarget,
+	describeFolderTarget
 } = pluginModule.__testables;
 
 const CLI_USAGE = [
@@ -177,7 +178,7 @@ async function runUploadFromCli(options = {}, dependencies = {}) {
 
 	const baseTitle = options.overrides?.targetTitle || path.parse(markdownPath).name;
 	logger.log(`[检查] 准备上传：${markdownPath}`);
-	logger.log(`[检查] 上传位置：${uploader.folderToken || '(未设置，默认根目录查重)'}`);
+	logger.log(`[检查] 上传位置：${describeFolderTarget(settings.folderHistory, uploader.folderToken)}`);
 
 	const documents = await uploader.listTargetDocuments();
 	const duplicates = documents.filter((item) => item.title === baseTitle);

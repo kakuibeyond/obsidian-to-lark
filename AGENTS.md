@@ -20,7 +20,8 @@
 
 - 检测并记录本机 `lark-cli` 路径
 - 发起飞书授权、展示当前授权状态、取消授权
-- 配置默认上传位置（`folder_token`）：可填写文件夹 token 或飞书云空间文件夹 URL（形如 `https://xxx.feishu.cn/drive/folder/fldcnXXXX`）；留空走飞书根目录；暂不支持 Wiki 链接
+- 配置默认上传位置（`folderToken`）：下拉选择「我的空间（根目录）」或历史文件夹；「＋ 新增」可填写文件夹 token 或飞书云空间文件夹 URL（形如 `https://xxx.feishu.cn/drive/folder/fldcnXXXX`）；暂不支持 Wiki 链接
+- 维护历史上传位置（`folderHistory`）：新增时自动解析文件夹名称，可改备注、重新同步名称、删除；删除当前位置时回落到根目录
 - 配置最低授权 scopes（`requiredAuthScopes`）
 - 配置以下上传行为：
   - 无同名飞书文档时是否自动创建
@@ -43,6 +44,14 @@
 - 支持 Mermaid 代码块转飞书文档内嵌画板，并按顺序插入
 - 支持 SVG 转 PNG 后上传
 - 上传过程中展示进度、日志、最终文档链接
+
+### 上传位置切换
+
+- 设置项 `folderToken` 仍是「当前生效位置」，`folderHistory` 是快捷切换来源（`[{ token, name, lastUsedAt }]`，按最近使用倒序，上限 20 条）
+- `normalizeSettings` 会把 URL 形式的 `folderToken` 收敛成裸 token，并把存量位置补进历史（迁移逻辑）
+- 名称解析走 `drive +inspect`；无效 token 时 lark-cli 仍返回 `ok:true` 但 `title` 为空，因此再用 `drive files list` 兜底校验可访问性
+- 上传确认弹窗（`UploadConfirmModal`）可临时切换本次目标位置，勾选后才会写回默认设置；不勾选只刷新 `lastUsedAt`
+- `UploadLogModal` 优先使用 `options.folderToken`，未传时回落到设置里的默认位置
 
 ### 文本转换规则
 
@@ -95,3 +104,5 @@
   - `node tests/cli-entry.test.js`
   - `node tests/image-fallback.test.js`
   - `node tests/lark-cli-env.test.js`
+  - `node tests/folder-history.test.js`
+  - `node tests/folder-picker-ui.test.js`

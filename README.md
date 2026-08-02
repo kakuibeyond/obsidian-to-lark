@@ -19,6 +19,7 @@
 - 支持同名飞书文档检测，并可配置：
   - 未命中同名文档时拒绝上传或自动创建
   - 命中同名文档时覆盖或新建后缀文档
+- 支持上传位置历史：设置页下拉切换常用文件夹，上传确认弹窗里也能临时改目标目录
 - 支持上传进度、日志和最终飞书文档链接展示
 
 ## 设置页
@@ -27,7 +28,11 @@
 
 - `lark-cli` 路径检测与保存
 - 飞书授权检测、授权、取消授权
-- 默认上传位置（文件夹 token 或飞书云空间文件夹 URL；留空走根目录；暂不支持 Wiki 链接）
+- 默认上传位置：
+  - 下拉选择「我的空间（根目录）」或任意历史文件夹，切换即生效
+  - 「＋ 新增」粘贴文件夹 token 或云空间文件夹 URL，自动调用 `lark-cli drive +inspect` 解析出文件夹名称后存入历史；无权限或 token 无效会直接拦下
+  - 历史条目可改备注名、重新同步名称、删除；删除当前位置会自动回落到根目录
+  - 最多保留 20 条，按最近使用时间排序；暂不支持 Wiki 链接
 - 最低授权 scopes
 - 是否忽略引用块
 - 是否将 SVG 转为 PNG
@@ -35,6 +40,15 @@
 - `<highlight>` 转 Callout 的开关、图标、背景色
 - 无同名文档时是否自动创建
 - 命中同名文档时覆盖还是新建
+
+## 上传确认弹窗
+
+点击上传后会先弹出确认框，可以在这里：
+
+- 用下拉临时切换本次上传的目标位置（默认选中设置里的默认上传位置）
+- 勾选「同时设为默认上传位置」把这次选择固化下来
+
+不勾选时，选择只对本次上传生效，只会把该位置的「最近使用时间」提前。
 
 ## 命令行入口
 
@@ -72,6 +86,10 @@ node tests/mermaid-whiteboard.test.js
 node tests/upload-target-selection.test.js
 node tests/upload-target-resolution.test.js
 node tests/svg-image-sizing.test.js
+node tests/image-fallback.test.js
+node tests/lark-cli-env.test.js
+node tests/folder-history.test.js
+node tests/folder-picker-ui.test.js
 node --check main.js
 node --check cli.js
 ```
