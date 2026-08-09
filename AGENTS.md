@@ -36,10 +36,11 @@
 - 读取当前 Markdown 文件绝对路径
 - 解析文本、Markdown 图片、Obsidian 图片、Mermaid 代码块，并按原始顺序拆分内容块
 - 自动定位图片文件：
-  - 当前目录
+  - Obsidian wikilink 路径是相对于 vault 根的；`findImagePath` 优先以 vault 根为基准解析带路径的链接（`path.resolve(vaultRoot, normalized)`），其次是当前目录
   - `attachments` / `images` / `assets` / `附件`
   - vault 根目录下的同名资源子目录
   - 精确匹配失败时，按图源中缀剥离兜底（如 `xxx.drawio.png` → `xxx.png`），覆盖 drawio/excalidraw/puml/plantuml/mmd/mermaid
+  - 纯文件名（无路径）链接失配时，在 vault 内按文件名做全局递归搜索兜底（`findFileByNameInTree`，跳过 `.obsidian`/`.git`/`node_modules`/隐藏目录、限制最大深度）；**带目录路径的链接不触发全局搜索**，避免同名不同路径的图片混淆
 - 支持图文混排顺序写入飞书文档
 - 支持 Mermaid 代码块转飞书文档内嵌画板，并按顺序插入
 - 支持 SVG 转 PNG 后上传

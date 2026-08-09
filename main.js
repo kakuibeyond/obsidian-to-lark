@@ -139,6 +139,62 @@ function buildImageFallbackFilenames(pureFilename) {
 	}
 	return [`${stem.slice(0, secondDot)}${ext}`];
 }
+
+// vault 全局递归搜索时跳过的目录名（不参与图片查找），避免扫描 Obsidian 配置、版本库等无关内容。
+const VAULT_SEARCH_SKIP_DIRS = new Set([
+	'.obsidian', '.git', '.gitignore', '.trash', '.cache',
+	'node_modules', '.DS_Store', '__pycache__'
+]);
+
+// 在目录树中按文件名递归查找匹配的文件，模拟 Obsidian 的「全局按名查找」行为。
+// 作为 findImagePath 的最终兜底：当图片被移到固定搜索目录之外的任意位置时仍能定位。
+// 跳过 .obsidian / .git / node_modules 等无关目录；限制最大深度避免极端嵌套。
+// options.findAll 设为 true 时收集全部匹配（数组），否则命中第一个即返回（null 表示没找到）。
+function findFileByNameInTree(rootDir, targetName, options) {
+	const name = String(targetName || '');
+	if (!name || !rootDir) {
+		return null;
+	}
+	const maxDepth = (options && Number.isInteger(options.maxDepth) && options.maxDepth > 0)
+		? options.maxDepth
+		: 10;
+	const skipDirs = (options && options.skipDirs instanceof Set)
+		? options.skipDirs
+		: VAULT_SEARCH_SKIP_DIRS;
+	const findAll = !!(options && options.findAll);
+
+	const results = [];
+	let stack = [{ dir: rootDir, depth: 0 }];
+	while (stack.length > 0) {
+		const { dir, depth } = stack.pop();
+		let entries;
+		try {
+			entries = fs.readdirSync(dir, { withFileTypes: true });
+		} catch (_error) {
+			continue;
+		}
+		// 先扫当前层的文件（命中即返回），再把子目录压栈，保证同层文件优先命中。
+		const subdirs = [];
+		for (const entry of entries) {
+			if (entry.isFile()) {
+				if (entry.name === name) {
+					if (!findAll) {
+						return path.join(dir, entry.name);
+					}
+					results.push(path.join(dir, entry.name));
+				}
+			} else if (entry.isDirectory()) {
+				if (depth + 1 < maxDepth && !skipDirs.has(entry.name) && !entry.name.startsWith('.')) {
+					subdirs.push(path.join(dir, entry.name));
+				}
+			}
+		}
+		for (const subdir of subdirs) {
+			stack.push({ dir: subdir, depth: depth + 1 });
+		}
+	}
+	return findAll ? results : null;
+}
 const DEFAULT_LARK_IMAGE_WIDTH = 1200;
 const SVG_UPLOAD_RASTER_SCALE = 4;
 const MIN_SVG_UPLOAD_WIDTH = 4800;
@@ -1597,6 +1653,9 @@ class LarkMarkdownUploader {
 
 		const vaultRoot = this.findVaultRoot(markdownDir);
 		if (vaultRoot) {
+			// Obsidian wikilink 的路径是相对于 vault 根的，直接解析完整路径最精确。
+			// 这是带路径 wikilink（如 ![[2-Projects/.../img.png]]）的最高优先级命中方式。
+			candidates.push(path.resolve(vaultRoot, normalized));
 			for (const subdir of IMAGE_SEARCH_SUBDIRS) {
 				candidates.push(path.resolve(vaultRoot, subdir, pureFilename));
 				candidates.push(path.resolve(vaultRoot, subdir, normalized));
@@ -1628,6 +1687,26 @@ class LarkMarkdownUploader {
 					if (fs.existsSync(candidate)) {
 						return candidate;
 					}
+				}
+			}
+		}
+
+		// 最终兜底：当 wikilink 是纯文件名（无路径）且图片被移到固定搜索目录之外时，
+		// 在 vault 内按文件名做一次全局递归搜索，模拟 Obsidian 的「全局按名查找」。
+		// 带目录路径的 wikilink 不启此兜底——路径是用户/Obsidian 明确指定的，不应猜。
+		const hasPath = normalized !== pureFilename;
+		if (vaultRoot && !hasPath) {
+			const searchNames = [pureFilename, ...fallbackNames];
+			for (const searchName of searchNames) {
+				const matches = findFileByNameInTree(vaultRoot, searchName, { findAll: true });
+				if (matches.length === 1) {
+					return matches[0];
+				}
+				if (matches.length > 1) {
+					const paths = matches.map((p) => `  - ${p}`).join('\n');
+					throw new Error(
+						`找到多个同名图片文件"${pureFilename}"，请使用带路径的链接来消除歧义：\n${paths}`
+					);
 				}
 			}
 		}
@@ -3029,6 +3108,7 @@ module.exports.__testables = {
 	parseObsidianImageSizeHint,
 	getSvgRasterUploadSize,
 	buildImageFallbackFilenames,
+	findFileByNameInTree,
 	buildLarkCliEnv,
 	mergeAdjacentTextBlocks,
 	withDocumentTitle,
