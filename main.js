@@ -369,19 +369,34 @@ function applyDefaultMermaidTheme(source, themeKey) {
 	return `${content}\n${styleLines.join('\n')}`;
 }
 
+// 零宽空格：飞书 markdown 会把「行首的 <text> 行内标签」当成 HTML 块级元素解析，结果是该标签
+// 之后的内容（乃至后续所有文本）被吞掉 —— 实测 `==x==：yyy` 这种行会让文档在 x 处直接截断。
+// 在行首的 <text 前插一个零宽空格即可打破块级判定，行内高亮样式不受影响，视觉上也没有痕迹。
+const ZERO_WIDTH_SPACE = '\u200B';
+
+function shieldLeadingInlineTextTag(line) {
+	return String(line || '').replace(
+		/^([ \t]*)<text\b/,
+		(_match, indent) => `${indent}${ZERO_WIDTH_SPACE}<text`
+	);
+}
+
 function convertObsidianHighlight(content, backgroundColor) {
 	return String(content || '')
 		.split(/\r?\n/)
 		.map((line) => {
 			const standaloneMatch = line.match(/^\s*==([^\r\n]+?)==\s*$/);
 			if (standaloneMatch) {
+				// 整行只有高亮时用 <p> 包裹：行首是块级 <p> 且同行闭合，飞书解析正常，无需遮挡。
 				return `<p><text background-color="${backgroundColor}">${standaloneMatch[1]}</text></p>`;
 			}
 
-			return line.replace(
+			const converted = line.replace(
 				/(?<!\=)==([^\r\n]+?)==(?!=)/g,
 				(_, text) => `<text background-color="${backgroundColor}">${text}</text>`
 			);
+			// 转换后（或用户手写的）<text> 若落在行首，必须遮挡，否则整段内容会被飞书截断。
+			return shieldLeadingInlineTextTag(converted);
 		})
 		.join('\n');
 }
@@ -3094,6 +3109,7 @@ module.exports.__testables = {
 	extractFetchedDocumentContent,
 	convertHighlightToCallout,
 	convertObsidianHighlight,
+	shieldLeadingInlineTextTag,
 	prepareTextBlockContent,
 	hasMeaningfulMarkdown,
 	serializeMermaidBlock,

@@ -11,7 +11,7 @@
   - Obsidian 图片语法 `![[...]]`
   - Mermaid 代码块
 - 支持常用格式转换：
-  - `==高亮==` 转飞书行内高亮，颜色可配置
+  - `==高亮==` 转飞书行内高亮，颜色可配置（高亮位于行首时会自动插入一个零宽空格，规避飞书把它误判成 HTML 块而丢失后续内容）
   - `<highlight>...</highlight>` 转飞书 Callout，支持开关、图标、背景色配置
   - Mermaid 代码块由 `lark-cli` 原生转换为飞书文档内嵌画板
 - 支持可选忽略引用块
@@ -90,6 +90,7 @@ node tests/image-fallback.test.js
 node tests/lark-cli-env.test.js
 node tests/folder-history.test.js
 node tests/folder-picker-ui.test.js
+node tests/inline-highlight.test.js
 node --check main.js
 node --check cli.js
 ```

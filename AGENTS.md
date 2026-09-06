@@ -57,6 +57,10 @@
 ### 文本转换规则
 
 - `==text==` 转飞书行内高亮
+  - 整行只有高亮时（如 `==text==` 独占一行）输出 `<p><text background-color="...">text</text></p>`，飞书按块级解析，正常
+  - 高亮落在**行首**时（如 `==text==：后续说明`），转换出的 `<text>` 会成为整行开头，飞书会把它当 HTML 块级元素解析，导致该行标签之后乃至后续所有内容被吞掉
+  - 因此 `shieldLeadingInlineTextTag` 会在行首（可含空格/制表符缩进）的 `<text` 前插入一个零宽空格 `U+200B` 打破块级判定；实测高亮样式不受影响，内容不再截断
+  - 代码块内容已被 `protectCodeBlocks` 占位，不受该规则影响
 - `<highlight>...</highlight>` 转飞书 Callout
 - 可选忽略 Markdown 引用块（`>` 开头）
 
@@ -107,3 +111,9 @@
   - `node tests/lark-cli-env.test.js`
   - `node tests/folder-history.test.js`
   - `node tests/folder-picker-ui.test.js`
+  - `node tests/inline-highlight.test.js`
+- 版本号更新原则
+  - 修复 bug 或小功能点优化时，小版本号递增（如 `1.0.0` -> `1.0.1`）
+  - 新增功能板块实现时，中版本号递增（如 `1.0.0` -> `1.1.0`）
+  - 重大架构调整时，大版本号递增（如 `1.0.0` -> `2.0.0`）
+  - 每一次更新版本号，都需要记录一次 `CHANGELOG.md`
