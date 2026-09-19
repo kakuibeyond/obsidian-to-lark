@@ -1,5 +1,34 @@
 # 更新日志
 
+## 0.0.5 - 2026-09-19
+
+### 修复
+
+- 修复「部分 Mermaid 图无法上传成功」：飞书的 markdown 导入管道会把代码块内的源码当 HTML/Markdown 处理，文中带 `<br/>` 的 mermaid 会被改写成真实换行，**时序图、甘特图**这类行语法随即被破坏
+  - `+update append` 路径：飞书直接返回失败（`degrade_code=2107 Whiteboard content parse failed`），上传中断
+  - `+create` 路径：返回 `ok: true` + warnings，**静默丢块**，文档里只剩空白
+  - 边界实测：`<br/>`（小写、无空格）必现；`<br />`、`<br>`、`<BR/>` 不会报错，但会被画板渲染器当成字面文本显示出来；同一份 `<br/>` 在 flowchart/stateDiagram/classDiagram/erDiagram/mindmap 里可正常解析，只在时序图、甘特图里翻车
+- 改为「先 append 一个空白画板占位，再用 `lark-cli whiteboard +update --input_format mermaid` 灌入源码」：源码不经过 markdown 导入管道，`<br/>` 被正确渲染成换行，实测两张时序图均正常（用户报告的文档第二个图已复现并验证修复）
+- 新增纯函数 `extractWhiteboardBlockId`：从 append 返回里取画板块 `block_id`（区别于 `block_token`）
+- 灌入失败时用 `docs +update --command block_delete` 回收占位空白画板，并抛出带 `Mermaid 画板写入失败：` 前缀的错误，不再在文档里留下空画板块
+- 明确不再向 mermaid 源码注入主题色：`classDef` / `linkStyle` 在时序图里直接导致 parse error（`applyDefaultMermaidTheme` 及 `mermaidColorTheme` 为历史遗留、已不在上传链路里，本次未改动）
+
+### 新增
+
+- 上传确认弹窗除「当前文件」外，新增显示「插件版本」，版本号读取 `manifest.json` 的 `version` 字段
+  - 新增纯函数 `resolvePluginVersion(plugin)`：优先用 Obsidian 已加载的 `plugin.manifest.version`，缺失时直接读插件目录下的 `manifest.json` 兜底（CLI / 测试环境）
+  - 新增样式 `.obsidian-to-lark-plugin-version`（弱化的小字号，与弹窗其它提示一致）
+  - `tests/folder-picker-ui.test.js` 补充断言：版本号优先级、回落、空白裁剪，以及弹窗里确实渲染出「插件版本：x.y.z」
+
+### 测试
+
+- 新增 `tests/mermaid-whiteboard-upload.test.js`：用 Node shebang 假 lark-cli 捕获真实子进程参数与临时文件内容，断言「append 空白占位 → 画板 API 灌入」的调用顺序、源码逐字透传（含 `<br/>`、不注入 `classDef`/`linkStyle`/色值）、失败时回收画板块并抛出可读错误
+
+### 文档
+
+- `AGENTS.md`：上传能力与「当前实现说明」改写 mermaid 上传机制，补充「不要改回 markdown 导入」的原因与 `<br/>` 各写法的实测结论，回归清单加入新用例；上传确认弹窗说明补充版本号展示
+- `README.md`：同步 mermaid 上传说明与开发校验清单
+
 ## 0.0.4 - 2026-09-06
 
 ### 修复

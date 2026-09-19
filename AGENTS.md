@@ -42,7 +42,7 @@
   - 精确匹配失败时，按图源中缀剥离兜底（如 `xxx.drawio.png` → `xxx.png`），覆盖 drawio/excalidraw/puml/plantuml/mmd/mermaid
   - 纯文件名（无路径）链接失配时，在 vault 内按文件名做全局递归搜索兜底（`findFileByNameInTree`，跳过 `.obsidian`/`.git`/`node_modules`/隐藏目录、限制最大深度）；**带目录路径的链接不触发全局搜索**，避免同名不同路径的图片混淆
 - 支持图文混排顺序写入飞书文档
-- 支持 Mermaid 代码块转飞书文档内嵌画板，并按顺序插入
+- 支持 Mermaid 代码块转飞书文档内嵌画板，并按顺序插入（先插空白画板占位，再用画板 API 灌入源码）
 - 支持 SVG 转 PNG 后上传
 - 上传过程中展示进度、日志、最终文档链接
 
@@ -91,7 +91,11 @@
 - 插件仅支持桌面端 Obsidian。
 - `lark-cli` 若是 Node shebang 脚本，插件会自动补 `node` 解释器调用。
 - 文档内容写入使用临时 Markdown 文件，并以相对路径传给 `lark-cli`，兼容其 `@file` 限制。
-- Mermaid 代码块直接通过 Docs API v2 的 Markdown 写入，由 `lark-cli` 原生转换为 `type="mermaid"` 的飞书画板。
+- Mermaid 代码块走**空白画板 + 画板 API**：先在文档末尾 append 一个 `<whiteboard type="blank"></whiteboard>` 占位（拿到 whiteboard token 与 block id），再用 `lark-cli whiteboard +update --input_format mermaid --source @file --overwrite` 把源码灌进去。
+  - **不要**改回「把 ```mermaid 代码块直接 append/写进文档」：飞书的 markdown 导入管道会把块内源码当 HTML/Markdown 处理，`<br/>` 会被改写成真实换行，时序图、甘特图语法随即被破坏 —— append 报 `degrade_code=2107 Whiteboard content parse failed`，`+create` 则是 `ok:true` + warnings 静默丢块（文档里只剩空白）。
+  - 走画板 API 时源码不经过 markdown 管道，`<br/>` 会被正确渲染成换行；`<br />`、`<br>` 反而会被画板渲染器当成字面文本显示，不要试图用它们“绕过”问题。
+  - 传给画板 API 的必须是**用户原始源码**，不要注入 `classDef`/`linkStyle`/`style`（时序图解析不了，会直接报 parse error）。
+  - 灌入失败时会用 `docs +update --command block_delete` 回收占位空白画板，再抛出带 `Mermaid 画板写入失败：` 前缀的错误。
 - `data.json` 是本地运行时配置文件，首次运行会由代码默认值自动生成；它包含本机路径、授权状态等个人信息，不应提交到 Git。
 - `runCommand` 为 lark-cli 子进程注入 `GODEBUG=x509usebrokenkeyscerts=1`（由纯函数 `buildLarkCliEnv` 构建），规避 Go 1.24+ 拒绝飞书小密钥 RSA 证书（`certificate is using a broken key size`）导致的 TLS 中断；用户已显式设置 `GODEBUG` 时追加、已含则不重复。
 
@@ -103,6 +107,7 @@
   - `node tests/defaults-and-auth.test.js`
   - `node tests/parse-markdown-blocks.test.js`
   - `node tests/mermaid-whiteboard.test.js`
+  - `node tests/mermaid-whiteboard-upload.test.js`
   - `node tests/upload-target-selection.test.js`
   - `node tests/upload-target-resolution.test.js`
   - `node tests/svg-image-sizing.test.js`

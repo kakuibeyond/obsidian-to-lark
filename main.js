@@ -536,6 +536,20 @@ function extractFetchedDocumentContent(payload) {
 		|| '';
 }
 
+// 飞书文档 markdown 里插入空白画板占位块的写法。
+const BLANK_WHITEBOARD_MARKUP = '<whiteboard type="blank"></whiteboard>';
+
+// 从 docs +create/+update 的返回里取新建画板块的 block_id，用于写入失败时回收空白画板。
+function extractWhiteboardBlockId(payload) {
+	const data = payload?.data || payload || {};
+	const newBlocks = Array.isArray(data.document?.new_blocks)
+		? data.document.new_blocks
+		: [];
+	const block = newBlocks.find((item) => item?.block_type === 'whiteboard' && item.block_id);
+
+	return block ? block.block_id : '';
+}
+
 function protectCodeBlocks(content) {
 	const placeholders = [];
 	const result = String(content || '').replace(
@@ -2042,7 +2056,7 @@ class LarkMarkdownUploader {
 			'append',
 			'--api-version',
 			'v2'
-		], '<whiteboard type="blank"></whiteboard>');
+		], BLANK_WHITEBOARD_MARKUP);
 
 		const payload = extractTrailingJson(stdout) || {};
 		let whiteboardToken = this.resolveWhiteboardToken(payload);
@@ -2056,16 +2070,18 @@ class LarkMarkdownUploader {
 			throw new Error('已创建空白画板，但未拿到 board token');
 		}
 
-		return whiteboardToken;
+		return { whiteboardToken, blockId: extractWhiteboardBlockId(payload) };
 	}
 
+	// 把 mermaid 源码灌进已存在的画板。注意这里传入的必须是**用户原始源码**：
+	// 画板 API 会按 mermaid 语义解析（`<br/>` 是换行），不经过飞书的 markdown 导入管道。
 	async updateWhiteboardFromMermaid(whiteboardToken, mermaidSource) {
-		const themed = applyDefaultMermaidTheme(mermaidSource, this.mermaidColorTheme);
+		const source = String(mermaidSource || '').trim();
 		const tempFile = path.join(
 			os.tmpdir(),
 			`obsidian-to-lark-mermaid-${Date.now()}-${Math.random().toString(36).slice(2)}.mmd`
 		);
-		await fs.promises.writeFile(tempFile, themed, 'utf8');
+		await fs.promises.writeFile(tempFile, source, 'utf8');
 		const tempDir = path.dirname(tempFile);
 		const tempName = path.basename(tempFile);
 
@@ -2088,9 +2104,45 @@ class LarkMarkdownUploader {
 		}
 	}
 
+	// 写入失败时把占位用的空白画板删掉，避免文档里留下一个空画板块。
+	async deleteDocumentBlock(docRef, blockId) {
+		if (!blockId) {
+			return;
+		}
+		try {
+			await runCommand(this.cliPath, [
+				'docs',
+				'+update',
+				'--as',
+				'user',
+				'--doc',
+				docRef,
+				'--command',
+				'block_delete',
+				'--block-id',
+				blockId,
+				'--api-version',
+				'v2'
+			]);
+		} catch (error) {
+			this.log(`[警告] 空白画板清理失败：${extractErrorMessage(error)}`);
+		}
+	}
+
 	async insertMermaid(docRef, mermaidSource, processed, total) {
 		this.log(`[上传] 插入 Mermaid 画板 ${processed}/${total}`);
-		await this.appendText(docRef, serializeMermaidBlock(mermaidSource));
+		// 不能把 ```mermaid 代码块直接 append 进文档：飞书的 markdown 导入管道会把块内源码当成 HTML/Markdown
+		// 处理，`<br/>` 会被改写成真实换行，时序图、甘特图的语法随即被破坏 —— 表现为 append 直接失败
+		// （degrade_code=2107 Whiteboard content parse failed），或 create 静默丢块、文档里只剩空白。
+		// 改为「先插一个空白画板占位，再用画板 API 灌入源码」，源码不经过 markdown 管道，换行等语义都正确。
+		const { whiteboardToken, blockId } = await this.appendBlankWhiteboard(docRef);
+
+		try {
+			await this.updateWhiteboardFromMermaid(whiteboardToken, mermaidSource);
+		} catch (error) {
+			await this.deleteDocumentBlock(docRef, blockId);
+			throw new Error(`Mermaid 画板写入失败：${extractErrorMessage(error)}`);
+		}
 	}
 
 	async upload(markdownPath, options = {}) {
@@ -2184,6 +2236,22 @@ let ObsidianToLarkPlugin;
 let UploadConfirmModal;
 let ObsidianToLarkSettingTab;
 
+// 读取插件版本号（manifest.json 的 version 字段）。优先用 Obsidian 已加载的 manifest
+// （它本身就是 manifest.json 的解析结果），CLI / 测试等没有 manifest 注入的场景再直接读文件。
+function resolvePluginVersion(plugin) {
+	const fromManifest = plugin?.manifest?.version;
+	if (fromManifest) {
+		return String(fromManifest).trim();
+	}
+
+	try {
+		const raw = fs.readFileSync(path.join(__dirname, 'manifest.json'), 'utf8');
+		return String(JSON.parse(raw)?.version || '').trim();
+	} catch (_error) {
+		return '';
+	}
+}
+
 if (Plugin) {
 	// 上传确认弹窗：顺手做本次上传的目标位置选择，避免为了换目录专门去设置页。
 	UploadConfirmModal = class UploadConfirmModal extends Modal {
@@ -2204,6 +2272,14 @@ if (Plugin) {
 			contentEl.empty();
 			contentEl.createEl('h3', { text: '确认上传到飞书云文档' });
 			contentEl.createEl('p', { text: `当前文件：${this.options.markdownPath}` });
+
+			const version = resolvePluginVersion(this.plugin);
+			if (version) {
+				contentEl.createEl('p', {
+					cls: 'obsidian-to-lark-plugin-version',
+					text: `插件版本：${version}`
+				});
+			}
 
 			const targetRow = contentEl.createDiv({ cls: 'obsidian-to-lark-target-row' });
 			targetRow.createSpan({ cls: 'obsidian-to-lark-target-label', text: '上传到：' });
@@ -3107,6 +3183,9 @@ module.exports.__testables = {
 	normalizeMermaidColorTheme,
 	extractWhiteboardTokenFromMarkdown,
 	extractFetchedDocumentContent,
+	extractWhiteboardBlockId,
+	BLANK_WHITEBOARD_MARKUP,
+	resolvePluginVersion,
 	convertHighlightToCallout,
 	convertObsidianHighlight,
 	shieldLeadingInlineTextTag,

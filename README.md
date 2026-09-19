@@ -13,7 +13,7 @@
 - 支持常用格式转换：
   - `==高亮==` 转飞书行内高亮，颜色可配置（高亮位于行首时会自动插入一个零宽空格，规避飞书把它误判成 HTML 块而丢失后续内容）
   - `<highlight>...</highlight>` 转飞书 Callout，支持开关、图标、背景色配置
-  - Mermaid 代码块由 `lark-cli` 原生转换为飞书文档内嵌画板
+  - Mermaid 代码块转飞书文档内嵌画板：先插入空白画板占位，再把 mermaid 源码交给画板 API 写入（不经过飞书的 markdown 导入管道，`<br/>` 换行等语义不会被改写）
 - 支持可选忽略引用块
 - 支持 SVG 转 PNG 后上传
 - 支持同名飞书文档检测，并可配置：
@@ -83,6 +83,7 @@ node tests/cli-entry.test.js
 node tests/defaults-and-auth.test.js
 node tests/parse-markdown-blocks.test.js
 node tests/mermaid-whiteboard.test.js
+node tests/mermaid-whiteboard-upload.test.js
 node tests/upload-target-selection.test.js
 node tests/upload-target-resolution.test.js
 node tests/svg-image-sizing.test.js

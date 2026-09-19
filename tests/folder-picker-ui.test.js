@@ -234,10 +234,37 @@ const {
 	normalizeSettings,
 	ObsidianToLarkSettingTab,
 	UploadConfirmModal,
-	ROOT_FOLDER_LABEL
+	ROOT_FOLDER_LABEL,
+	resolvePluginVersion
 } = pluginModule.__testables;
 
 const PluginClass = pluginModule;
+const manifestVersion = JSON.parse(
+	require('fs').readFileSync(path.resolve(__dirname, '..', 'manifest.json'), 'utf8')
+).version;
+
+// --- 版本号读取：优先用 Obsidian 注入的 manifest，缺失时回落到 manifest.json ---
+assert.strictEqual(
+	resolvePluginVersion({ manifest: { version: '9.9.9' } }),
+	'9.9.9',
+	'有 manifest 时应以 manifest.version 为准'
+);
+assert.strictEqual(
+	resolvePluginVersion({ manifest: { version: ' 1.2.3 ' } }),
+	'1.2.3',
+	'版本号应去掉首尾空白'
+);
+assert.strictEqual(
+	resolvePluginVersion({}),
+	manifestVersion,
+	'没有 manifest 时回落到插件目录下的 manifest.json'
+);
+assert.strictEqual(resolvePluginVersion(null), manifestVersion, '空插件实例安全回落');
+assert.strictEqual(
+	resolvePluginVersion({ manifest: { version: '' } }),
+	manifestVersion,
+	'manifest.version 为空时应回落'
+);
 
 function createPluginStub(initialSettings) {
 	const plugin = new PluginClass();
@@ -379,6 +406,16 @@ function createTab(plugin) {
 		);
 		assert.strictEqual(select.value, 'fldA');
 
+		// 弹窗除「当前文件」外还要显示插件版本（取自 manifest.json）
+		const confirmTexts = modal.contentEl.collect((el) => el.tagName === 'p').map((el) => el.textContent);
+		assert.ok(
+			confirmTexts.includes('当前文件：/tmp/note.md'),
+			'确认弹窗应显示当前文件路径'
+		);
+		const versionLine = modal.contentEl.findByClass('obsidian-to-lark-plugin-version')[0];
+		assert.ok(versionLine, '确认弹窗应渲染插件版本行');
+		assert.strictEqual(versionLine.textContent, `插件版本：${manifestVersion}`);
+
 		select.value = 'fldB';
 		select.dispatch('change');
 
@@ -400,8 +437,15 @@ function createTab(plugin) {
 	// --- 上传确认弹窗：取消 ------------------------------------------------
 	{
 		const plugin = createPluginStub({});
+		// 模拟真实 Obsidian 环境：插件实例带有已加载的 manifest
+		plugin.manifest = { version: '1.2.3' };
 		const modal = new UploadConfirmModal({}, plugin, { markdownPath: '/tmp/note.md' });
 		const decisionPromise = modal.waitForDecision();
+		assert.strictEqual(
+			modal.contentEl.findByClass('obsidian-to-lark-plugin-version')[0].textContent,
+			'插件版本：1.2.3',
+			'有 manifest 时应显示 manifest.version'
+		);
 		modal.contentEl.findButton('取消').onclick();
 		const decision = await decisionPromise;
 		assert.strictEqual(decision.confirmed, false);

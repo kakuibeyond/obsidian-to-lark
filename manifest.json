@@ -1,7 +1,7 @@
 {
   "id": "obsidian-to-lark",
   "name": "Obsidian 转飞书文档",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "minAppVersion": "1.4.0",
   "description": "一键将 Obsidian 笔记上传到飞书云文档",
   "author": "Will",
