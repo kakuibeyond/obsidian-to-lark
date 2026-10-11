@@ -1,5 +1,27 @@
 # 更新日志
 
+## 0.0.8 - 2026-10-11
+
+### 修复
+
+- 修复从桌面启动 Obsidian 时 Mermaid fallback 已找到 `npx`、但 `whiteboard-cli` 的二级 Node shebang 报 `env: node: No such file or directory`：子进程环境会把实际解释器目录补到 `PATH` 最前面
+
+### 测试
+
+- `tests/mermaid-whiteboard-upload.test.js` 的相邻 `npx` 用例会在受限 `PATH` 中再次启动 `node`，真实覆盖本次二级子进程失败
+
+## 0.0.7 - 2026-10-11
+
+### 修复
+
+- Mermaid 画板仍优先走 `lark-cli whiteboard +update --input_format mermaid` 直传；当飞书服务端转换偶发失败时，自动调用官方 `@larksuite/whiteboard-cli@0.2.13` 在本地把原始 Mermaid 转成 OpenAPI 节点，再以 `raw` 格式写回同一个画板
+- fallback 默认优先解析与 `lark-cli` 同目录的 `npx`（兼容 Obsidian 启动时 `PATH` 不完整的场景），找不到时再使用环境中的 `npx`
+- 直传和 fallback 都失败时，错误信息会同时保留两段失败原因，并回收已插入的空白画板；转换结果无节点时也会拦截写入，Mermaid 与 OpenAPI 临时文件始终清理
+
+### 测试
+
+- 扩展 `tests/mermaid-whiteboard-upload.test.js`，覆盖直传成功、直传失败后 raw fallback 成功、相邻 `npx` 解析、无效转换结果、双路径失败报错以及占位画板和临时文件清理
+
 ## 0.0.5 - 2026-09-19
 
 ### 修复

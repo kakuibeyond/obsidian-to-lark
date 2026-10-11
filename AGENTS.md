@@ -42,7 +42,7 @@
   - 精确匹配失败时，按图源中缀剥离兜底（如 `xxx.drawio.png` → `xxx.png`），覆盖 drawio/excalidraw/puml/plantuml/mmd/mermaid
   - 纯文件名（无路径）链接失配时，在 vault 内按文件名做全局递归搜索兜底（`findFileByNameInTree`，跳过 `.obsidian`/`.git`/`node_modules`/隐藏目录、限制最大深度）；**带目录路径的链接不触发全局搜索**，避免同名不同路径的图片混淆
 - 支持图文混排顺序写入飞书文档
-- 支持 Mermaid 代码块转飞书文档内嵌画板，并按顺序插入（先插空白画板占位，再用画板 API 灌入源码）
+- 支持 Mermaid 代码块转飞书文档内嵌画板，并按顺序插入（先插空白画板占位，优先用画板 API 直传 Mermaid；失败时本地转换成 OpenAPI 节点并以 `raw` 格式重试）
 - 支持 SVG 转 PNG 后上传
 - 上传过程中展示进度、日志、最终文档链接
 
@@ -91,11 +91,15 @@
 - 插件仅支持桌面端 Obsidian。
 - `lark-cli` 若是 Node shebang 脚本，插件会自动补 `node` 解释器调用。
 - 文档内容写入使用临时 Markdown 文件，并以相对路径传给 `lark-cli`，兼容其 `@file` 限制。
-- Mermaid 代码块走**空白画板 + 画板 API**：先在文档末尾 append 一个 `<whiteboard type="blank"></whiteboard>` 占位（拿到 whiteboard token 与 block id），再用 `lark-cli whiteboard +update --input_format mermaid --source @file --overwrite` 把源码灌进去。
+- Mermaid 代码块走**空白画板 + 画板 API**：先在文档末尾 append 一个 `<whiteboard type="blank"></whiteboard>` 占位（拿到 whiteboard token 与 block id），再优先用 `lark-cli whiteboard +update --input_format mermaid --source @file --overwrite` 把原始源码直传。
   - **不要**改回「把 ```mermaid 代码块直接 append/写进文档」：飞书的 markdown 导入管道会把块内源码当 HTML/Markdown 处理，`<br/>` 会被改写成真实换行，时序图、甘特图语法随即被破坏 —— append 报 `degrade_code=2107 Whiteboard content parse failed`，`+create` 则是 `ok:true` + warnings 静默丢块（文档里只剩空白）。
   - 走画板 API 时源码不经过 markdown 管道，`<br/>` 会被正确渲染成换行；`<br />`、`<br>` 反而会被画板渲染器当成字面文本显示，不要试图用它们“绕过”问题。
   - 传给画板 API 的必须是**用户原始源码**，不要注入 `classDef`/`linkStyle`/`style`（时序图解析不了，会直接报 parse error）。
-  - 灌入失败时会用 `docs +update --command block_delete` 回收占位空白画板，再抛出带 `Mermaid 画板写入失败：` 前缀的错误。
+  - Mermaid 直传失败时，用官方 `@larksuite/whiteboard-cli@0.2.13` 在本地把同一份原始源码转成 OpenAPI 节点，并通过 `lark-cli whiteboard +update --input_format raw` 写回同一个占位画板；只有直传失败才执行该 fallback。
+  - 默认优先使用与 `lark-cli` 同目录的 `npx`（包括解析后的绝对路径附近），找不到时才回落到环境中的 `npx`，以兼容 Obsidian 桌面进程的 `PATH` 不完整；首次 fallback 可能需要联网下载精确锁定版本的转换器。
+  - `runCommand` 会把实际执行命令（例如解析 Node shebang 后的绝对 `node`）所在目录补到子进程 `PATH` 最前面，避免 `npx` 后续启动 `whiteboard-cli` 时出现 `env: node: No such file or directory`。
+  - 转换器返回的 OpenAPI 数据必须包含非空 `nodes`；无效结果不会进入 raw 写入。Mermaid 与 raw JSON 临时文件无论成功失败都会清理。
+  - 直传和 fallback 都失败时，会合并保留两段错误原因，再用 `docs +update --command block_delete` 回收占位空白画板，并由外层抛出带 `Mermaid 画板写入失败：` 前缀的错误。
 - `data.json` 是本地运行时配置文件，首次运行会由代码默认值自动生成；它包含本机路径、授权状态等个人信息，不应提交到 Git。
 - `runCommand` 为 lark-cli 子进程注入 `GODEBUG=x509usebrokenkeyscerts=1`（由纯函数 `buildLarkCliEnv` 构建），规避 Go 1.24+ 拒绝飞书小密钥 RSA 证书（`certificate is using a broken key size`）导致的 TLS 中断；用户已显式设置 `GODEBUG` 时追加、已含则不重复。
 
@@ -108,6 +112,7 @@
   - `node tests/parse-markdown-blocks.test.js`
   - `node tests/mermaid-whiteboard.test.js`
   - `node tests/mermaid-whiteboard-upload.test.js`
+    - 覆盖 Mermaid 直传、`whiteboard-cli` 转 OpenAPI 后 raw 重试、相邻 `npx` 解析、无效转换结果、双路径错误合并、占位块与临时文件清理
   - `node tests/upload-target-selection.test.js`
   - `node tests/upload-target-resolution.test.js`
   - `node tests/svg-image-sizing.test.js`

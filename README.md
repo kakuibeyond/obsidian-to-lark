@@ -13,7 +13,7 @@
 - 支持常用格式转换：
   - `==高亮==` 转飞书行内高亮，颜色可配置（高亮位于行首时会自动插入一个零宽空格，规避飞书把它误判成 HTML 块而丢失后续内容）
   - `<highlight>...</highlight>` 转飞书 Callout，支持开关、图标、背景色配置
-  - Mermaid 代码块转飞书文档内嵌画板：先插入空白画板占位，再把 mermaid 源码交给画板 API 写入（不经过飞书的 markdown 导入管道，`<br/>` 换行等语义不会被改写）
+  - Mermaid 代码块转飞书文档内嵌画板：先插入空白画板占位，再优先把原始 Mermaid 源码交给画板 API；若飞书服务端转换失败，会用官方 `@larksuite/whiteboard-cli@0.2.13` 在本地转成 OpenAPI 节点，并以 `raw` 格式自动重试
 - 支持可选忽略引用块
 - 支持 SVG 转 PNG 后上传
 - 支持同名飞书文档检测，并可配置：
@@ -71,6 +71,12 @@ node cli.js ./docs/plans/测试文档.md --help
 ## 本地配置
 
 `data.json` 是本地运行时配置文件，插件首次启动时会按代码默认值自动生成。这个文件可能包含本机路径、授权状态等个人信息，不应提交到 Git。
+
+## 运行依赖
+
+- 必须安装并完成 `lark-cli` 配置；插件仍不依赖 Python 运行时。
+- Mermaid 正常情况下直接通过 `lark-cli` 写入。仅在该路径失败时，插件才会通过 `npx` 运行精确锁定版本的官方 `@larksuite/whiteboard-cli@0.2.13` 做本地转换；首次 fallback 可能需要联网下载该包。
+- 为兼容从桌面启动 Obsidian 时 `PATH` 不完整，插件会优先寻找与 `lark-cli` 同目录的 `npx`，再回落到环境中的 `npx`，并把实际 Node 解释器目录补入子进程 `PATH`，确保 `whiteboard-cli` 的二级 shebang 也能找到 Node。因此建议用同一套 Node.js 安装同时提供 `lark-cli` 与 `npx`。
 
 ## 适用场景
 

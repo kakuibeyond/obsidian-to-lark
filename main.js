@@ -113,6 +113,7 @@ const COMMON_BINARY_PATHS = {
 const OBSIDIAN_IMAGE_PATTERN = /!\[\[([^\|\]]+)(?:\|([^\]]*))?\]\]/g;
 const MARKDOWN_IMAGE_PATTERN = /!\[([^\]]*)\]\(([^\)]+)\)/g;
 const MERMAID_FENCE_PATTERN = /```mermaid[^\n]*\r?\n([\s\S]*?)```/gi;
+const WHITEBOARD_CONVERTER_PACKAGE = '@larksuite/whiteboard-cli@0.2.13';
 const SEARCHABLE_DOC_TYPES = new Set(['DOC', 'DOCX']);
 const IMAGE_SEARCH_SUBDIRS = ['attachments', 'images', 'assets', '附件'];
 // 图源工具导出图片时常见的文件名中缀，例如 diagram.drawio.png、sketch.excalidraw.png。
@@ -777,10 +778,108 @@ function buildSearchPaths(executable) {
 	return [...COMMON_BINARY_PATHS[key], ...pathEntries].filter(Boolean);
 }
 
+function buildWindowsWhiteboardConverterCandidates({
+	cliPaths = [],
+	npxPaths = [],
+	nodePaths = [],
+	standardNodeDirs = []
+} = {}) {
+	const pathApi = path.win32;
+	const absoluteDirectories = [];
+	const addDirectory = (candidate) => {
+		if (typeof candidate === 'string' && pathApi.isAbsolute(candidate)) {
+			absoluteDirectories.push(candidate);
+		}
+	};
+
+	for (const nodePath of nodePaths) {
+		if (typeof nodePath === 'string' && pathApi.isAbsolute(nodePath)) {
+			addDirectory(pathApi.dirname(nodePath));
+		}
+	}
+	for (const npxPath of npxPaths) {
+		if (typeof npxPath === 'string' && pathApi.isAbsolute(npxPath)) {
+			addDirectory(pathApi.dirname(npxPath));
+		}
+	}
+	for (const cliPath of cliPaths) {
+		if (typeof cliPath === 'string' && pathApi.isAbsolute(cliPath)) {
+			addDirectory(pathApi.dirname(cliPath));
+		}
+	}
+	for (const directory of standardNodeDirs) {
+		addDirectory(directory);
+	}
+
+	const directories = Array.from(new Set(absoluteDirectories));
+	const nodeCandidates = Array.from(new Set([
+		...nodePaths.filter((candidate) =>
+			typeof candidate === 'string'
+			&& pathApi.isAbsolute(candidate)
+			&& pathApi.basename(candidate).toLowerCase() === 'node.exe'
+		),
+		...directories.map((directory) => pathApi.join(directory, 'node.exe'))
+	]));
+	const npxCliCandidates = directories.map((directory) =>
+		pathApi.join(directory, 'node_modules', 'npm', 'bin', 'npx-cli.js')
+	);
+	const pairs = [];
+	const seen = new Set();
+	const addPair = (nodePath, npxCliPath) => {
+		const key = `${nodePath.toLowerCase()}\n${npxCliPath.toLowerCase()}`;
+		if (!seen.has(key)) {
+			seen.add(key);
+			pairs.push({ nodePath, npxCliPath });
+		}
+	};
+
+	for (const directory of directories) {
+		addPair(
+			pathApi.join(directory, 'node.exe'),
+			pathApi.join(directory, 'node_modules', 'npm', 'bin', 'npx-cli.js')
+		);
+	}
+	for (const nodePath of nodeCandidates) {
+		for (const npxCliPath of npxCliCandidates) {
+			addPair(nodePath, npxCliPath);
+		}
+	}
+
+	return pairs;
+}
+
+function selectExistingWindowsWhiteboardConverter(candidates, existingPaths) {
+	const pathApi = path.win32;
+	const existing = new Set(
+		Array.from(existingPaths || [], (candidate) => String(candidate || '').toLowerCase())
+	);
+
+	for (const candidate of candidates || []) {
+		if (
+			pathApi.isAbsolute(candidate?.nodePath || '')
+			&& pathApi.isAbsolute(candidate?.npxCliPath || '')
+			&& existing.has(candidate.nodePath.toLowerCase())
+			&& existing.has(candidate.npxCliPath.toLowerCase())
+		) {
+			return candidate;
+		}
+	}
+
+	return null;
+}
+
 async function exists(filePath) {
 	try {
 		await fs.promises.access(filePath, fs.constants.F_OK);
 		return true;
+	} catch (_error) {
+		return false;
+	}
+}
+
+async function isFile(filePath) {
+	try {
+		return (await fs.promises.stat(filePath)).isFile();
 	} catch (_error) {
 		return false;
 	}
@@ -936,6 +1035,23 @@ function buildLarkCliEnv(baseEnv) {
 	return env;
 }
 
+function buildCommandEnv(baseEnv, invocationCommand) {
+	const env = buildLarkCliEnv(baseEnv);
+	if (!path.isAbsolute(invocationCommand || '')) {
+		return env;
+	}
+
+	const pathKey = Object.keys(env).find((key) => key.toLowerCase() === 'path') || 'PATH';
+	const executableDir = path.dirname(invocationCommand);
+	const existingPath = String(env[pathKey] || '');
+	const pathEntries = existingPath.split(path.delimiter).filter(Boolean);
+	if (!pathEntries.includes(executableDir)) {
+		env[pathKey] = [executableDir, ...pathEntries].join(path.delimiter);
+	}
+
+	return env;
+}
+
 async function runCommand(command, args, options = {}) {
 	const invocation = await resolveCommandInvocation(command);
 	const finalArgs = [...invocation.argsPrefix, ...args];
@@ -945,7 +1061,7 @@ async function runCommand(command, args, options = {}) {
 			encoding: 'utf8',
 			maxBuffer: 50 * 1024 * 1024,
 			cwd: options.cwd,
-			env: buildLarkCliEnv(process.env),
+			env: buildCommandEnv(process.env, invocation.command),
 			windowsHide: true
 		});
 	} catch (error) {
@@ -1488,6 +1604,8 @@ async function fetchFolderMeta(cliPath, rawValue) {
 class LarkMarkdownUploader {
 	constructor(options) {
 		this.cliPath = options.cliPath;
+		this.whiteboardConverterCommand = options.whiteboardConverterCommand || 'npx';
+		this.hasInjectedWhiteboardConverterCommand = Boolean(options.whiteboardConverterCommand);
 		this.folderToken = resolveFolderToken(options.folderToken);
 		this.ignoreBlockquotes = options.ignoreBlockquotes === true;
 		this.convertSvgToRaster = options.convertSvgToRaster === true;
@@ -2086,6 +2204,82 @@ class LarkMarkdownUploader {
 		const tempName = path.basename(tempFile);
 
 		try {
+			try {
+				await runCommand(this.cliPath, [
+					'whiteboard',
+					'+update',
+					'--as',
+					'user',
+					'--whiteboard-token',
+					whiteboardToken,
+					'--input_format',
+					'mermaid',
+					'--source',
+					`@./${tempName}`,
+					'--overwrite'
+				], { cwd: tempDir });
+				return;
+			} catch (directError) {
+				this.log('[兼容] Mermaid 直传失败，正在本地转换后以 raw 格式重试');
+				try {
+					await this.updateWhiteboardFromConvertedMermaid(
+						whiteboardToken,
+						tempDir,
+						tempName
+					);
+					return;
+				} catch (fallbackError) {
+					throw new Error(
+						`Mermaid 直传失败：${extractErrorMessage(directError)}；`
+						+ `本地转换/raw 重试失败：${extractErrorMessage(fallbackError)}`
+					);
+				}
+			}
+		} finally {
+			await fs.promises.unlink(tempFile).catch(() => undefined);
+		}
+	}
+
+	async updateWhiteboardFromConvertedMermaid(whiteboardToken, tempDir, mermaidTempName) {
+		const converterInvocation = await this.resolveWhiteboardConverterInvocation();
+		const converterArgs = [...converterInvocation.argsPrefix];
+		converterArgs.push(
+			'-i',
+			`./${mermaidTempName}`,
+			'-f',
+			'mermaid',
+			'-t',
+			'openapi',
+			'-F',
+			'data'
+		);
+
+		const { stdout } = await runCommand(converterInvocation.command, converterArgs, { cwd: tempDir });
+		const convertedPayload = extractTrailingJson(stdout);
+		if (!convertedPayload || typeof convertedPayload !== 'object' || Array.isArray(convertedPayload)) {
+			throw new Error('本地转换器未返回有效的 OpenAPI JSON');
+		}
+		if (convertedPayload.ok === false) {
+			throw new Error(
+				convertedPayload.error?.message || convertedPayload.message || '本地转换器报告失败'
+			);
+		}
+
+		const openApiData = convertedPayload.data && typeof convertedPayload.data === 'object'
+			? convertedPayload.data
+			: convertedPayload;
+		if (!Array.isArray(openApiData.nodes) || openApiData.nodes.length === 0) {
+			throw new Error('本地转换器返回的 OpenAPI JSON 不包含画板节点');
+		}
+
+		const rawTempFile = path.join(
+			tempDir,
+			`obsidian-to-lark-whiteboard-${Date.now()}-${Math.random().toString(36).slice(2)}.json`
+		);
+		const rawTempName = path.basename(rawTempFile);
+
+		try {
+			await fs.promises.writeFile(rawTempFile, JSON.stringify(openApiData), 'utf8');
 			await runCommand(this.cliPath, [
 				'whiteboard',
 				'+update',
@@ -2094,14 +2288,86 @@ class LarkMarkdownUploader {
 				'--whiteboard-token',
 				whiteboardToken,
 				'--input_format',
-				'mermaid',
+				'raw',
 				'--source',
-				`@./${tempName}`,
+				`@./${rawTempName}`,
 				'--overwrite'
 			], { cwd: tempDir });
 		} finally {
-			await fs.promises.unlink(tempFile).catch(() => undefined);
+			await fs.promises.unlink(rawTempFile).catch(() => undefined);
 		}
+	}
+
+	async resolveWhiteboardConverterInvocation() {
+		if (this.hasInjectedWhiteboardConverterCommand) {
+			return { command: this.whiteboardConverterCommand, argsPrefix: [] };
+		}
+
+		const resolvedCliPath = await getAbsolutePath(this.cliPath);
+		const cliPaths = Array.from(new Set([this.cliPath, resolvedCliPath]))
+			.filter((candidate) => path.isAbsolute(candidate));
+
+		if (process.platform === 'win32') {
+			const resolvedNpxPath = await getAbsolutePath('npx');
+			const resolvedNodePath = await getAbsolutePath('node');
+			const adjacentNpxPaths = cliPaths.flatMap((cliPath) => {
+				const cliDir = path.dirname(cliPath);
+				return ['npx.cmd', 'npx.bat', 'npx.exe', 'npx'].map((name) => path.join(cliDir, name));
+			});
+			const standardNodeDirs = [
+				process.env.ProgramFiles ? path.join(process.env.ProgramFiles, 'nodejs') : '',
+				process.env['ProgramFiles(x86)'] ? path.join(process.env['ProgramFiles(x86)'], 'nodejs') : '',
+				process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Programs', 'nodejs') : '',
+				process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'nodejs') : ''
+			].filter(Boolean);
+			const runtimeCandidates = buildWindowsWhiteboardConverterCandidates({
+				cliPaths,
+				npxPaths: [...adjacentNpxPaths, resolvedNpxPath],
+				nodePaths: [resolvedNodePath],
+				standardNodeDirs
+			});
+			const existingRuntimePaths = [];
+			const pathsToVerify = new Set(runtimeCandidates.flatMap((candidate) => [
+				candidate.nodePath,
+				candidate.npxCliPath
+			]));
+
+			for (const candidatePath of pathsToVerify) {
+				if (path.isAbsolute(candidatePath) && await isFile(candidatePath)) {
+					existingRuntimePaths.push(candidatePath);
+				}
+			}
+			const runtime = selectExistingWindowsWhiteboardConverter(
+				runtimeCandidates,
+				existingRuntimePaths
+			);
+			if (runtime) {
+				return {
+					command: runtime.nodePath,
+					argsPrefix: [runtime.npxCliPath, '-y', WHITEBOARD_CONVERTER_PACKAGE]
+				};
+			}
+
+			throw new Error(
+				'找不到可用的绝对 node.exe + npm npx-cli.js，无法执行 Mermaid 本地转换；请确认 Node.js/npm 安装完整'
+			);
+		}
+
+		for (const cliPath of cliPaths) {
+			const cliDir = path.dirname(cliPath);
+			const candidate = path.join(cliDir, 'npx');
+			if (await exists(candidate)) {
+				return {
+					command: candidate,
+					argsPrefix: ['-y', WHITEBOARD_CONVERTER_PACKAGE]
+				};
+			}
+		}
+
+		return {
+			command: 'npx',
+			argsPrefix: ['-y', WHITEBOARD_CONVERTER_PACKAGE]
+		};
 	}
 
 	// 写入失败时把占位用的空白画板删掉，避免文档里留下一个空画板块。
@@ -3205,6 +3471,8 @@ module.exports.__testables = {
 	buildImageFallbackFilenames,
 	findFileByNameInTree,
 	buildLarkCliEnv,
+	buildWindowsWhiteboardConverterCandidates,
+	selectExistingWindowsWhiteboardConverter,
 	mergeAdjacentTextBlocks,
 	withDocumentTitle,
 	escapeXmlText,
