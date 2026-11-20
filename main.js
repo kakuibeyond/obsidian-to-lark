@@ -13,6 +13,15 @@ const { promisify } = require('util');
 
 const execFileAsync = promisify(execFile);
 
+// Mermaid 写入策略（设置页三选一）：
+//   fallback：支持的走画板，不支持的降级为文本绘图（默认）
+//   strict  ：支持的走画板，不支持的直接报错中断上传
+//   diagram ：一律写文本绘图块，不走画板
+const MERMAID_MODES = Object.freeze(['fallback', 'strict', 'diagram']);
+const MERMAID_MODE_FALLBACK = 'fallback';
+const MERMAID_MODE_STRICT = 'strict';
+const MERMAID_MODE_DIAGRAM = 'diagram';
+
 const DEFAULT_SETTINGS = {
 	larkCliPath: '',
 	folderToken: '',
@@ -23,6 +32,7 @@ const DEFAULT_SETTINGS = {
 	duplicateDocStrategy: 'overwrite',
 	ignoreBlockquotes: false,
 	convertSvgToRaster: false,
+	mermaidMode: MERMAID_MODE_FALLBACK,
 	highlightToCallout: true,
 	calloutEmoji: '💡',
 	calloutBackgroundColor: 'light-blue',
@@ -45,6 +55,17 @@ function normalizeSettings(rawSettings) {
 	merged.duplicateDocStrategy = merged.duplicateDocStrategy === 'create_new'
 		? 'create_new'
 		: 'overwrite';
+	// 旧版是布尔开关 mermaidUnsupportedToDiagram（默认 true），迁移到三选一的字符串模式后删掉旧字段。
+	// 注意先判断旧字段：DEFAULT_SETTINGS 已经给 mermaidMode 填了默认值，不能拿它判断"用户是否设置过"。
+	if (rawSettings && typeof rawSettings === 'object'
+		&& rawSettings.mermaidUnsupportedToDiagram !== undefined
+		&& rawSettings.mermaidMode === undefined) {
+		merged.mermaidMode = merged.mermaidUnsupportedToDiagram === false
+			? MERMAID_MODE_STRICT
+			: MERMAID_MODE_FALLBACK;
+	}
+	delete merged.mermaidUnsupportedToDiagram;
+	merged.mermaidMode = normalizeMermaidMode(merged.mermaidMode);
 	delete merged.mermaidColorTheme;
 
 	merged.requiredAuthScopes = Array.from(new Set(
@@ -114,6 +135,36 @@ const OBSIDIAN_IMAGE_PATTERN = /!\[\[([^\|\]]+)(?:\|([^\]]*))?\]\]/g;
 const MARKDOWN_IMAGE_PATTERN = /!\[([^\]]*)\]\(([^\)]+)\)/g;
 const MERMAID_FENCE_PATTERN = /```mermaid[^\n]*\r?\n([\s\S]*?)```/gi;
 const WHITEBOARD_CONVERTER_PACKAGE = '@larksuite/whiteboard-cli@0.2.13';
+// 飞书画板 API（whiteboard +update --input_format mermaid）和官方转换器共用的 Mermaid 类型白名单。
+// 不在白名单里的类型（journey、journal、未知语法等）直传与本地转换都会报
+// "parse Mermaid failed, type: xxx not supported"。
+const WHITEBOARD_MERMAID_TYPES = Object.freeze([
+	'flowchart',
+	'flowchart-v2',
+	'flowchart-elk',
+	'sequence',
+	'pie',
+	'mindmap',
+	'timeline',
+	'gantt',
+	'class',
+	'er',
+	'stateDiagram',
+	'quadrantChart',
+	'xychart'
+]);
+const WHITEBOARD_MERMAID_TYPE_SET = new Set(
+	WHITEBOARD_MERMAID_TYPES.map((type) => type.toLowerCase())
+);
+// 文档级「文本绘图」块（飞书插入菜单里的那一种）的 OpenAPI 标识：
+// block_type=40（add_ons），record 里存 mermaid 源码与视图。
+// view 实测取值：codeChart=图表和代码、chart=仅显示图表。
+const DIAGRAM_BLOCK_TYPE = 40;
+const DIAGRAM_COMPONENT_TYPE_ID = 'blk_631fefbbae02400430b8f9f4';
+const DIAGRAM_VIEW_CHART = 'chart';
+const DIAGRAM_VIEW_CODE = 'codeChart';
+const DIAGRAM_THEME = 'default';
+const WHITEBOARD_DIAGRAM_SUPPORTED_PATTERN = /not supported, supported types:/i;
 const SEARCHABLE_DOC_TYPES = new Set(['DOC', 'DOCX']);
 const IMAGE_SEARCH_SUBDIRS = ['attachments', 'images', 'assets', '附件'];
 // 图源工具导出图片时常见的文件名中缀，例如 diagram.drawio.png、sketch.excalidraw.png。
@@ -139,6 +190,122 @@ function buildImageFallbackFilenames(pureFilename) {
 		return [];
 	}
 	return [`${stem.slice(0, secondDot)}${ext}`];
+}
+
+// 归一化 Mermaid 写入策略：非法/缺失一律回到默认的 fallback。
+function normalizeMermaidMode(value) {
+	const raw = String(value || '').trim().toLowerCase();
+	return MERMAID_MODES.includes(raw) ? raw : MERMAID_MODE_FALLBACK;
+}
+
+// 取 Mermaid 的图类型：跳过 BOM、空行、`%%` 注释和 `%%{init}%%` 指令，
+// 以及飞书文本绘图块自带的 `--- frontmatter ---`，取第一行有效声明。
+// 只做"够用"的归一化：不解析完整语法，只用于判断类型是否在白名单内。
+function extractMermaidDiagramType(mermaidSource) {
+	const lines = String(mermaidSource || '').replace(/^\uFEFF/, '').split(/\r?\n/);
+	let index = 0;
+
+	// YAML 前端头（文本绘图块的写法）：--- 开头、以单独的 --- 或 ... 结束
+	if (lines[index] !== undefined && lines[index].trim() === '---') {
+		index += 1;
+		while (index < lines.length) {
+			const fence = lines[index].trim();
+			index += 1;
+			if (fence === '---' || fence === '...') {
+				break;
+			}
+		}
+	}
+
+	for (; index < lines.length; index += 1) {
+		const line = lines[index].trim();
+		if (!line || line.startsWith('%%')) {
+			continue;
+		}
+
+		const match = /^([A-Za-z][\w-]*)(?: \w+)?/.exec(line);
+		if (!match) {
+			return '';
+		}
+
+		const token = match[1].toLowerCase();
+		if (token === 'flowchart') {
+			// `flowchart TD` / `flowchart-elk LR` 都归到 flowchart，避免 elk 渲染器差异
+			return 'flowchart';
+		}
+		if (token === 'graph') {
+			return 'flowchart-v2';
+		}
+		if (token === 'sequencediagram') {
+			return 'sequence';
+		}
+		if (token === 'statediagram' || token === 'statediagram-v2') {
+			return 'statediagram';
+		}
+		return token;
+	}
+
+	return '';
+}
+
+// 飞书画板 API 是否支持这种 Mermaid 类型。类型识别不出来时按"不支持"处理：
+// 交给文本绘图块至少能显示出来，比整篇笔记上传失败要好。forced=true 时无条件降级。
+function shouldUseDiagramBlock(mermaidSource, options = {}) {
+	if (options.forced === true) {
+		return true;
+	}
+	const type = extractMermaidDiagramType(mermaidSource);
+	if (!type) {
+		return true;
+	}
+	return !WHITEBOARD_MERMAID_TYPE_SET.has(type);
+}
+
+// 识别"飞书画板不支持该 Mermaid 类型"这类错误（直传失败或转换器失败都可能返回）。
+function isUnsupportedMermaidTypeError(error) {
+	const message = extractErrorMessage(error);
+	return WHITEBOARD_DIAGRAM_SUPPORTED_PATTERN.test(message);
+}
+
+// 从错误信息里抠出 `type: journey not supported` 中的类型名，用于提示文案。
+function extractUnsupportedMermaidType(error) {
+	const match = /type:\s*([A-Za-z][\w-]*)\s+not supported/i.exec(extractErrorMessage(error));
+	return match ? match[1] : '';
+}
+
+// 文本绘图块的 record.data 必须是带 YAML 前端头的 Mermaid：
+// 实测没有 `---` 头时飞书按普通代码块渲染（即便 view=chart），带头的才显示成图。
+function buildDiagramSource(mermaidSource, options = {}) {
+	const source = String(mermaidSource || '').trim();
+	if (/^---\s*(\r?\n|$)/.test(source)) {
+		return source;
+	}
+
+	const title = String(options.title || '').trim().replace(/\s+/g, ' ');
+	return `---\ntitle: ${title || 'Mermaid'}\n---\n${source}`;
+}
+
+function buildDiagramBlockRecord(mermaidSource, options = {}) {
+	return JSON.stringify({
+		data: buildDiagramSource(mermaidSource, options),
+		theme: options.theme || DIAGRAM_THEME,
+		view: options.view || DIAGRAM_VIEW_CHART
+	});
+}
+
+function buildDiagramBlockCreateBody(mermaidSource, options = {}) {
+	return JSON.stringify({
+		index: -1,
+		children: [
+			{
+				block_type: DIAGRAM_BLOCK_TYPE,
+				add_ons: {
+					component_type_id: DIAGRAM_COMPONENT_TYPE_ID,
+					record: buildDiagramBlockRecord(mermaidSource, options)
+				}
+			}
+		]
+	});
 }
 
 // vault 全局递归搜索时跳过的目录名（不参与图片查找），避免扫描 Obsidian 配置、版本库等无关内容。
@@ -372,13 +539,14 @@ function applyDefaultMermaidTheme(source, themeKey) {
 
 // 零宽空格：飞书 markdown 会把「行首的 <text> 行内标签」当成 HTML 块级元素解析，结果是该标签
 // 之后的内容（乃至后续所有文本）被吞掉 —— 实测 `==x==：yyy` 这种行会让文档在 x 处直接截断。
-// 在行首的 <text 前插一个零宽空格即可打破块级判定，行内高亮样式不受影响，视觉上也没有痕迹。
+// 在行首（包括列表、任务列表、引用等 Markdown 容器前缀之后）的 <text 前插一个零宽空格即可
+// 打破块级判定，行内高亮样式不受影响，视觉上也没有痕迹。
 const ZERO_WIDTH_SPACE = '\u200B';
 
 function shieldLeadingInlineTextTag(line) {
 	return String(line || '').replace(
-		/^([ \t]*)<text\b/,
-		(_match, indent) => `${indent}${ZERO_WIDTH_SPACE}<text`
+		/^((?:[ \t]*>[ \t]*)*[ \t]*(?:(?:[-+*]|\d+[.)])[ \t]+(?:\[[ xX]\][ \t]+)?)?)<text\b/,
+		(_match, markdownPrefix) => `${markdownPrefix}${ZERO_WIDTH_SPACE}<text`
 	);
 }
 
@@ -1020,6 +1188,32 @@ function extractErrorMessage(error) {
 	return (candidates.find(Boolean) || '命令执行失败').trim();
 }
 
+function formatAuthFailureMessage(error) {
+	const rawMessage = extractErrorMessage(error);
+	const diagnosticText = [error?.stdout, error?.stderr, error?.message, rawMessage]
+		.filter(Boolean)
+		.join('\n');
+	const compactMessage = rawMessage.replace(/\s+/g, ' ').trim();
+
+	if (/proxy detected|https?_proxy|proxy connect|proxyconnect/i.test(diagnosticText)) {
+		return `授权失败：检测到网络代理异常。请确认代理软件正在运行且允许访问 open.feishu.cn；也可在终端临时设置 LARK_CLI_NO_PROXY=1 测试直连。原始错误：${compactMessage}`;
+	}
+	if (/resolving timed out|no such host|name or service not known|enotfound|dns/i.test(diagnosticText)) {
+		return `授权失败：DNS 解析异常，无法解析飞书域名。请切换网络或 DNS 后重试。原始错误：${compactMessage}`;
+	}
+	if (/certificate|x509|tls|ssl/i.test(diagnosticText)) {
+		return `授权失败：TLS/证书校验异常。请检查代理的 HTTPS 解密、系统时间和证书信任设置。原始错误：${compactMessage}`;
+	}
+	if (/timed?\s*out|deadline exceeded|etimedout/i.test(diagnosticText)) {
+		return `授权失败：连接飞书开放平台超时。请检查网络、代理或防火墙后重试。原始错误：${compactMessage}`;
+	}
+	if (/connection refused|connection reset|econnrefused|econnreset/i.test(diagnosticText)) {
+		return `授权失败：网络连接被拒绝或重置。请检查代理、防火墙和网络出口。原始错误：${compactMessage}`;
+	}
+
+	return `授权失败：${compactMessage}`;
+}
+
 // lark-cli 底层由 Go 二进制发起 HTTPS 请求。Go 1.24+ 默认拒绝 RSA 密钥 < 1024 位的
 // 证书（报 "certificate is using a broken key size"），而飞书部分 API 端点的证书链命中
 // 了该校验，会导致上传中断。这里为 lark-cli 子进程注入 GODEBUG 开关以恢复旧行为；
@@ -1609,6 +1803,7 @@ class LarkMarkdownUploader {
 		this.folderToken = resolveFolderToken(options.folderToken);
 		this.ignoreBlockquotes = options.ignoreBlockquotes === true;
 		this.convertSvgToRaster = options.convertSvgToRaster === true;
+		this.mermaidMode = normalizeMermaidMode(options.mermaidMode);
 		this.highlightToCallout = options.highlightToCallout !== false;
 		this.calloutEmoji = options.calloutEmoji || '💡';
 		this.calloutBackgroundColor = options.calloutBackgroundColor || 'light-blue';
@@ -2395,7 +2590,89 @@ class LarkMarkdownUploader {
 		}
 	}
 
-	async insertMermaid(docRef, mermaidSource, processed, total) {
+	// 通过 docx OpenAPI 往文档末尾插一个飞书「文本绘图」块（插入菜单里的那一种）。
+	// 它属于 add_ons 扩展块，没有对应的 DocxXML 标签，docs +update 写不了，只能走原生 API。
+	async appendDiagramBlock(docRef, mermaidSource, options = {}) {
+		const body = buildDiagramBlockCreateBody(mermaidSource, options);
+		await this.runApiCommand(
+			['POST', `/open-apis/docx/v1/documents/${encodeURIComponent(docRef)}/blocks/${encodeURIComponent(docRef)}/children`],
+			body
+		);
+		return { view: options.view || DIAGRAM_VIEW_CHART };
+	}
+
+	// 同一条 API 路径在旧版 lark-cli 上可能只是普通子命令，依次尝试两种写法。
+	async runApiCommand(apiArgs, body) {
+		const attempts = [
+			['api', ...apiArgs, '--as', 'user', '--data', body],
+			[apiArgs[0], apiArgs[1], '--as', 'user', '--data', body]
+		];
+		let lastError = null;
+
+		for (const args of attempts) {
+			try {
+				return await runCommand(this.cliPath, args);
+			} catch (error) {
+				lastError = error;
+				if (!/unknown command|unknown flag|not support/i.test(extractErrorMessage(error))) {
+					throw error;
+				}
+			}
+		}
+
+		throw lastError;
+	}
+
+	// 画板写不进去时的降级：把同一份源码写进「文本绘图」块，视图直接设为仅显示图表。
+	async insertDiagramBlock(docRef, mermaidSource, options = {}) {
+		const { view } = await this.appendDiagramBlock(docRef, mermaidSource, {
+			title: options.title,
+			view: options.view,
+			theme: options.theme
+		});
+		const viewLabel = view === DIAGRAM_VIEW_CHART ? '仅显示图表' : '图表和代码';
+		return {
+			blockType: 'diagram',
+			view,
+			hint: `已改为飞书「文本绘图」块（视图：${viewLabel}）`
+		};
+	}
+
+	async insertMermaid(docRef, mermaidSource, processed, total, options = {}) {
+		const title = options.title || '';
+		const mode = this.mermaidMode;
+		const type = extractMermaidDiagramType(mermaidSource);
+		const unsupported = shouldUseDiagramBlock(mermaidSource);
+
+		// diagram 模式：所有 Mermaid 都写文本绘图块，不走画板
+		if (mode === MERMAID_MODE_DIAGRAM) {
+			this.log(`[上传] 插入 Mermaid 文本绘图 ${processed}/${total}（全部使用文本绘图）`);
+			const result = await this.insertDiagramBlock(docRef, mermaidSource, { title });
+			this.log(`[提示] ${result.hint}；飞书文档里的文本绘图块可自行切换显示视图`);
+			return result;
+		}
+
+		// strict 模式：白名单外直接报错，不插画板也不降级
+		if (mode === MERMAID_MODE_STRICT && unsupported) {
+			throw new Error(
+				`Mermaid 画板写入失败：飞书画板不支持该图类型`
+				+ (type ? `（${type}）` : '（未能识别图类型）')
+				+ `。可在设置页把「Mermaid 写入方式」改为降级为文本绘图，或改用画板支持的类型（${WHITEBOARD_MERMAID_TYPES.join('、')}）。`
+			);
+		}
+
+		// fallback 模式（默认）：白名单外的类型飞书画板和官方转换器都会拒绝，
+		// 不必先插占位画板再回收，直接写文本绘图块。
+		if (mode === MERMAID_MODE_FALLBACK && unsupported) {
+			this.log(
+				`[上传] 插入 Mermaid 文本绘图 ${processed}/${total}`
+				+ (type ? `（${type} 不在飞书画板支持的类型内）` : '（未能识别图类型）')
+			);
+			const result = await this.insertDiagramBlock(docRef, mermaidSource, { title });
+			this.log(`[提示] ${result.hint}；飞书文档里的文本绘图块可自行切换显示视图`);
+			return result;
+		}
+
 		this.log(`[上传] 插入 Mermaid 画板 ${processed}/${total}`);
 		// 不能把 ```mermaid 代码块直接 append 进文档：飞书的 markdown 导入管道会把块内源码当成 HTML/Markdown
 		// 处理，`<br/>` 会被改写成真实换行，时序图、甘特图的语法随即被破坏 —— 表现为 append 直接失败
@@ -2405,9 +2682,22 @@ class LarkMarkdownUploader {
 
 		try {
 			await this.updateWhiteboardFromMermaid(whiteboardToken, mermaidSource);
+			return { blockType: 'whiteboard' };
 		} catch (error) {
 			await this.deleteDocumentBlock(docRef, blockId);
-			throw new Error(`Mermaid 画板写入失败：${extractErrorMessage(error)}`);
+			const message = extractErrorMessage(error);
+
+			// 类型判断有偏差时（白名单外的语法混进来）再兜底降级一次，避免整篇上传失败。
+			// 用整段错误链判断：画板直传被拒、或本地转换器同类型报错，都算"类型不支持"。
+			if (mode === MERMAID_MODE_FALLBACK && isUnsupportedMermaidTypeError(error)) {
+				const type = extractUnsupportedMermaidType(error);
+				this.log(`[兼容] 飞书画板不支持该 Mermaid 类型${type ? `（${type}）` : ''}，改为写入文本绘图块`);
+				const result = await this.insertDiagramBlock(docRef, mermaidSource, { title });
+				this.log(`[提示] ${result.hint}；飞书文档里的文本绘图块可自行切换显示视图`);
+				return result;
+			}
+
+			throw new Error(`Mermaid 画板写入失败：${message}`);
 		}
 	}
 
@@ -2485,7 +2775,7 @@ class LarkMarkdownUploader {
 				this.log(`[上传] 插入图片 ${processed}/${remainingBlocks}：${path.basename(imagePath)}`);
 				await this.insertImage(docId, imagePath, block.caption, block);
 			} else {
-				await this.insertMermaid(docId, block.content, processed, remainingBlocks);
+				await this.insertMermaid(docId, block.content, processed, remainingBlocks, { title });
 			}
 
 			this.progress(percent);
@@ -2669,6 +2959,7 @@ if (Plugin) {
 					folderToken: String(targetFolderToken || '').trim(),
 					ignoreBlockquotes: this.plugin.settings.ignoreBlockquotes,
 					convertSvgToRaster: this.plugin.settings.convertSvgToRaster,
+					mermaidMode: this.plugin.settings.mermaidMode,
 					highlightToCallout: this.plugin.settings.highlightToCallout,
 					calloutEmoji: this.plugin.settings.calloutEmoji,
 					calloutBackgroundColor: this.plugin.settings.calloutBackgroundColor,
@@ -2966,7 +3257,7 @@ if (Plugin) {
 				await this.refreshAuthStatus({ save: true, fallbackStatus: finalStatus });
 				return { success: finalStatus.success, message: this.settings.lastAuthMessage };
 			} catch (error) {
-				const message = `授权失败：${error.message || String(error)}`;
+				const message = formatAuthFailureMessage(error);
 				this.settings.lastAuthMessage = message;
 				await this.saveSettings();
 				return { success: false, message };
@@ -3128,6 +3419,21 @@ if (Plugin) {
 						.setValue(this.plugin.settings.ignoreBlockquotes)
 						.onChange(async (value) => {
 							this.plugin.settings.ignoreBlockquotes = value;
+							await this.plugin.saveSettings();
+						});
+				});
+
+			new Setting(containerEl)
+				.setName('Mermaid 写入方式')
+				.setDesc('默认「不支持的降级为文本绘图」：画板支持的类型仍生成可编辑画板，journey 等不支持的类型改写为飞书「文本绘图」块（视图：仅显示图表）。')
+				.addDropdown((dropdown) => {
+					dropdown
+						.addOption(MERMAID_MODE_FALLBACK, '不支持的降级为文本绘图（默认）')
+						.addOption(MERMAID_MODE_STRICT, '不支持的 Mermaid 中止报错')
+						.addOption(MERMAID_MODE_DIAGRAM, '所有 Mermaid 均使用文本绘图')
+						.setValue(normalizeMermaidMode(this.plugin.settings.mermaidMode))
+						.onChange(async (value) => {
+							this.plugin.settings.mermaidMode = normalizeMermaidMode(value);
 							await this.plugin.saveSettings();
 						});
 				});
@@ -3429,6 +3735,7 @@ module.exports.__testables = {
 	getAbsolutePath,
 	parseAuthStatusPayload,
 	formatAuthStatusMessage,
+	formatAuthFailureMessage,
 	normalizeSettings,
 	resolveFolderToken,
 	safeResolveFolderToken,
@@ -3473,6 +3780,22 @@ module.exports.__testables = {
 	buildLarkCliEnv,
 	buildWindowsWhiteboardConverterCandidates,
 	selectExistingWindowsWhiteboardConverter,
+	extractMermaidDiagramType,
+	shouldUseDiagramBlock,
+	isUnsupportedMermaidTypeError,
+	extractUnsupportedMermaidType,
+	buildDiagramSource,
+	buildDiagramBlockRecord,
+	buildDiagramBlockCreateBody,
+	WHITEBOARD_MERMAID_TYPES,
+	DIAGRAM_COMPONENT_TYPE_ID,
+	DIAGRAM_VIEW_CHART,
+	DIAGRAM_VIEW_CODE,
+	MERMAID_MODES,
+	MERMAID_MODE_FALLBACK,
+	MERMAID_MODE_STRICT,
+	MERMAID_MODE_DIAGRAM,
+	normalizeMermaidMode,
 	mergeAdjacentTextBlocks,
 	withDocumentTitle,
 	escapeXmlText,

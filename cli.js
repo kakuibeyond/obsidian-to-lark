@@ -28,6 +28,9 @@ const CLI_USAGE = [
 	'  --duplicate-strategy <mode>         overwrite | create_new',
 	'  --ignore-blockquotes                Ignore Markdown blockquotes',
 	'  --keep-blockquotes                  Keep blockquotes in upload',
+	'  --mermaid-mode <mode>               fallback | strict | diagram (default: fallback)',
+	'  --mermaid-diagram-fallback          Alias for --mermaid-mode fallback',
+	'  --no-mermaid-diagram-fallback       Alias for --mermaid-mode strict',
 	'  --svg-to-png                        Rasterize SVG before upload',
 	'  --no-svg-to-png                     Keep SVG as-is',
 	'  --highlight-to-callout              Convert <highlight> to callout',
@@ -113,6 +116,16 @@ function parseCliArgs(argv) {
 		case '--keep-blockquotes':
 			result.overrides.ignoreBlockquotes = false;
 			break;
+		case '--mermaid-mode':
+			result.overrides.mermaidMode = takeValue(index, arg);
+			index += 1;
+			break;
+		case '--mermaid-diagram-fallback':
+			result.overrides.mermaidMode = 'fallback';
+			break;
+		case '--no-mermaid-diagram-fallback':
+			result.overrides.mermaidMode = 'strict';
+			break;
 		case '--svg-to-png':
 			result.overrides.convertSvgToRaster = true;
 			break;
@@ -168,6 +181,7 @@ async function runUploadFromCli(options = {}, dependencies = {}) {
 		folderToken: settings.folderToken,
 		ignoreBlockquotes: settings.ignoreBlockquotes,
 		convertSvgToRaster: settings.convertSvgToRaster,
+		mermaidMode: settings.mermaidMode,
 		highlightToCallout: settings.highlightToCallout,
 		calloutEmoji: settings.calloutEmoji,
 		calloutBackgroundColor: settings.calloutBackgroundColor,

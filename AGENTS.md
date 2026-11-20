@@ -28,6 +28,7 @@
   - 命中同名飞书文档时覆盖或新建
   - 是否忽略引用块
   - 是否将 SVG 转为 PNG 后上传
+  - Mermaid 写入方式 `mermaidMode`（三选一）：`fallback` 不支持的降级为文本绘图（默认）、`strict` 不支持的直接报错、`diagram` 全部写文本绘图
   - `==高亮==` 的飞书行内高亮颜色
   - `<highlight>...</highlight>` 转 Callout 的开关、图标、背景色
 
@@ -43,6 +44,7 @@
   - 纯文件名（无路径）链接失配时，在 vault 内按文件名做全局递归搜索兜底（`findFileByNameInTree`，跳过 `.obsidian`/`.git`/`node_modules`/隐藏目录、限制最大深度）；**带目录路径的链接不触发全局搜索**，避免同名不同路径的图片混淆
 - 支持图文混排顺序写入飞书文档
 - 支持 Mermaid 代码块转飞书文档内嵌画板，并按顺序插入（先插空白画板占位，优先用画板 API 直传 Mermaid；失败时本地转换成 OpenAPI 节点并以 `raw` 格式重试）
+- 飞书画板不支持 Mermaid 类型时降级为文档「文本绘图」块（详见「Mermaid 画板与文本绘图」）
 - 支持 SVG 转 PNG 后上传
 - 上传过程中展示进度、日志、最终文档链接
 
@@ -100,6 +102,15 @@
   - `runCommand` 会把实际执行命令（例如解析 Node shebang 后的绝对 `node`）所在目录补到子进程 `PATH` 最前面，避免 `npx` 后续启动 `whiteboard-cli` 时出现 `env: node: No such file or directory`。
   - 转换器返回的 OpenAPI 数据必须包含非空 `nodes`；无效结果不会进入 raw 写入。Mermaid 与 raw JSON 临时文件无论成功失败都会清理。
   - 直传和 fallback 都失败时，会合并保留两段错误原因，再用 `docs +update --command block_delete` 回收占位空白画板，并由外层抛出带 `Mermaid 画板写入失败：` 前缀的错误。
+
+## Mermaid 画板与文本绘图
+
+- 飞画画板 API 与官方 `whiteboard-cli` 共用同一份 Mermaid 类型白名单：`flowchart(-v2/-elk)`、`sequence`、`pie`、`mindmap`、`timeline`、`gantt`、`class`、`er`、`stateDiagram`、`quadrantChart`、`xychart`。`journey` / `journal` 等不在里面，直传与本地转换都会报 `parse Mermaid failed, type: xxx not supported`（`WHITEBOARD_MERMAID_TYPES`）。
+- 写入策略由 `mermaidMode` 控制：`fallback`（默认）白名单外/识别不出类型的图**不插画板**，直接写飞书原生「文本绘图」块；`strict` 遇到这类图直接抛错（不插画板、不写文本绘图）；`diagram` 所有 Mermaid 都走文本绘图块。文本绘图块的写法：`block_type=40`（`add_ons`），`component_type_id=blk_631fefbbae02400430b8f9f4`，`record={"data","theme","view"}`。写入走 `lark-cli api POST /open-apis/docx/v1/documents/{doc}/blocks/{doc}/children`（`runApiCommand` 会在旧版 CLI 上退回 `POST` 子命令写法）。
+- `record.data` **必须带 `--- title ---` 前端头**：实测没有前端头时飞书按普通代码块渲染（`view` 设成 chart 也没用），带前端头的才会显示成图。`view` 取值实测为 `chart`＝仅显示图表、`codeChart`＝图表和代码；改已有块的视图用 `PATCH .../blocks/{id}` 会报 `1770001 invalid param`，只能插入时定好视图。
+- `fallback` 模式下类型判断有偏差时（画板直传或本地转换器报 `not supported`），会先 `block_delete` 回收占位画板，再降级写文本绘图块，不中断整篇上传；`strict`/`diagram` 模式不做运行期降级。
+- 旧版布尔设置 `mermaidUnsupportedToDiagram` 在 `normalizeSettings` 里迁移：`true`→`fallback`、`false`→`strict`，迁移后删除旧字段；`mermaidMode` 非法值回落到 `fallback`。
+- 类型识别 `extractMermaidDiagramType` 会跳过 BOM、空行、`%%` 注释、`%%{init}%%` 指令与 `---` 前端头，只取第一行有效声明，`graph`→`flowchart-v2`、`sequenceDiagram`→`sequence`、`stateDiagram-v2`→`statediagram`。
 - `data.json` 是本地运行时配置文件，首次运行会由代码默认值自动生成；它包含本机路径、授权状态等个人信息，不应提交到 Git。
 - `runCommand` 为 lark-cli 子进程注入 `GODEBUG=x509usebrokenkeyscerts=1`（由纯函数 `buildLarkCliEnv` 构建），规避 Go 1.24+ 拒绝飞书小密钥 RSA 证书（`certificate is using a broken key size`）导致的 TLS 中断；用户已显式设置 `GODEBUG` 时追加、已含则不重复。
 
@@ -113,6 +124,8 @@
   - `node tests/mermaid-whiteboard.test.js`
   - `node tests/mermaid-whiteboard-upload.test.js`
     - 覆盖 Mermaid 直传、`whiteboard-cli` 转 OpenAPI 后 raw 重试、相邻 `npx` 解析、无效转换结果、双路径错误合并、占位块与临时文件清理
+  - `node tests/mermaid-diagram-fallback.test.js`
+    - 覆盖图类型识别、白名单判定、前端头与 `add_ons` record 构造、`mermaidMode` 归一化与旧字段迁移、三种写入模式（fallback 直接降级 / strict 报错 / diagram 全部文本绘图）、白名单内仍走画板、画板报类型不支持后回收画板再降级
   - `node tests/upload-target-selection.test.js`
   - `node tests/upload-target-resolution.test.js`
   - `node tests/svg-image-sizing.test.js`

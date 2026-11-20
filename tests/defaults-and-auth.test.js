@@ -32,6 +32,7 @@ const {
 	normalizeSettings,
 	shouldPersistSettings,
 	formatAuthStatusMessage,
+	formatAuthFailureMessage,
 	parseAuthStatusPayload
 } = pluginModule.__testables;
 
@@ -88,6 +89,27 @@ assert.deepStrictEqual(parsed, {
 assert.strictEqual(
 	formatAuthStatusMessage(parsed),
 	'已授权：测试用户 (ou_test_123)'
+);
+
+assert.match(
+	formatAuthFailureMessage({ stdout: '[WARN] proxy detected: HTTPS_PROXY=http://127.0.0.1:60226', message: 'killed' }),
+	/检测到网络代理异常/
+);
+assert.match(
+	formatAuthFailureMessage({ stderr: 'dial tcp: lookup open.feishu.cn: no such host' }),
+	/DNS 解析异常/
+);
+assert.match(
+	formatAuthFailureMessage({ message: 'x509: certificate signed by unknown authority' }),
+	/TLS\/证书校验异常/
+);
+assert.match(
+	formatAuthFailureMessage({ message: 'request timed out' }),
+	/连接飞书开放平台超时/
+);
+assert.strictEqual(
+	formatAuthFailureMessage({ message: 'scope is invalid' }),
+	'授权失败：scope is invalid'
 );
 
 console.log('defaults and auth parsing align with requested behavior');

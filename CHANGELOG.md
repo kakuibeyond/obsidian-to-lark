@@ -1,5 +1,29 @@
 # 更新日志
 
+## 0.1.0 - 2026-11-20
+
+### 新增
+
+- Mermaid 代码块遇到飞书画板不支持的类型（`journey`、`journal` 及无法识别的语法）时，不再让整篇上传失败，而是跳过画板、直接写成飞书文档原生的「文本绘图」块（插入菜单里的那一种），视图预置为「仅显示图表」
+  - 写入走 docx 原生接口 `POST /open-apis/docx/v1/documents/{doc}/blocks/{doc}/children`，块为 `block_type=40`（`add_ons`，`component_type_id=blk_631fefbbae02400430b8f9f4`）
+  - `record.data` 必须带 `--- title ---` 前端头：实测只有带前端头的才渲染成图，`view` 取值 `chart`＝仅显示图表、`codeChart`＝图表和代码
+- 设置页新增「Mermaid 写入方式」三选一下拉：
+  - 不支持的降级为文本绘图（默认）：画板支持的类型仍生成可编辑画板，`journey` 等不支持的类型改写为文本绘图块
+  - 不支持的 Mermaid 中止报错：支持的类型走画板，不支持的类型直接报错中断上传
+  - 所有 Mermaid 均使用文本绘图：不走画板，全部写文本绘图块
+  - 命令行对应 `--mermaid-mode fallback|strict|diagram`，并保留 `--mermaid-diagram-fallback`（=fallback）、`--no-mermaid-diagram-fallback`（=strict）作为别名
+- 上传日志会说明该图走的是文本绘图块以及原因（例如「journey 不在飞书画板支持的类型内」）
+
+### 变更
+
+- 类型判断有偏差时（画板直传或本地转换器报 `parse Mermaid failed, type: xxx not supported`）也会先回收占位空白画板，再降级写文本绘图块，而不是中断上传
+- 识别 Mermaid 图类型时跳过 BOM、空行、`%%` 注释、`%%{init}%%` 指令与 `---` 前端头，避免误判
+- 设置项由布尔开关 `mermaidUnsupportedToDiagram` 改为字符串 `mermaidMode`；`normalizeSettings` 会自动迁移旧值（`true`→`fallback`、`false`→`strict`）并删除旧字段
+
+### 测试
+
+- 新增 `tests/mermaid-diagram-fallback.test.js`，覆盖图类型识别、白名单判定、前端头与 `add_ons` record 构造、`mermaidMode` 归一化与旧字段迁移、三种写入模式，以及假 `lark-cli` 驱动的链路：白名单外直接降级、strict 报错、diagram 全部文本绘图、白名单内仍走画板、画板报类型不支持后回收画板再降级
+
 ## 0.0.8 - 2026-10-11
 
 ### 修复
@@ -21,6 +45,17 @@
 ### 测试
 
 - 扩展 `tests/mermaid-whiteboard-upload.test.js`，覆盖直传成功、直传失败后 raw fallback 成功、相邻 `npx` 解析、无效转换结果、双路径失败报错以及占位画板和临时文件清理
+
+## 0.0.6 - 2026-10-09
+
+### 修复
+
+- 改进设置页“前往授权”的失败提示：根据 `lark-cli` 的 stdout、stderr 与错误信息，区分代理异常、DNS 解析失败、TLS/证书问题、连接超时和连接被拒绝/重置，不再只显示笼统的“授权失败”
+- 网络类错误会附带对应排查方向和精简后的原始错误，便于判断代理软件、DNS、防火墙或证书链问题
+
+### 测试
+
+- `tests/defaults-and-auth.test.js` 新增授权网络错误分类与普通业务错误回退测试
 
 ## 0.0.5 - 2026-09-19
 

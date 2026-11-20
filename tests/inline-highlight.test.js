@@ -47,6 +47,20 @@ assert.strictEqual(
 	'行首的 <text> 前应插入零宽空格'
 );
 
+// Markdown 容器前缀后的行首高亮也必须遮挡。否则 `- ==高亮==后续` 转换后，
+// `<text>` 虽不在物理行首，却仍是列表项内容的行首，会被飞书误判为 HTML 块。
+const markdownContainerCases = [
+	['- ==评估维度==不能长期写死在代码中', `- ${ZWSP}<text background-color="${COLOR}">评估维度</text>不能长期写死在代码中`],
+	['  * ==嵌套列表==后续', `  * ${ZWSP}<text background-color="${COLOR}">嵌套列表</text>后续`],
+	['1. ==有序列表==后续', `1. ${ZWSP}<text background-color="${COLOR}">有序列表</text>后续`],
+	['- [ ] ==任务列表==后续', `- [ ] ${ZWSP}<text background-color="${COLOR}">任务列表</text>后续`],
+	['> ==引用==后续', `> ${ZWSP}<text background-color="${COLOR}">引用</text>后续`],
+	['> - ==引用列表==后续', `> - ${ZWSP}<text background-color="${COLOR}">引用列表</text>后续`]
+];
+for (const [input, expected] of markdownContainerCases) {
+	assert.strictEqual(convertObsidianHighlight(input, COLOR), expected, `Markdown 容器内高亮应被遮挡：${input}`);
+}
+
 // 行内（非行首）高亮不应该被污染
 const inlineConverted = convertObsidianHighlight('前缀 ==高亮== 后缀', COLOR);
 assert.strictEqual(
@@ -119,4 +133,19 @@ assert.ok(
 assert.ok(prepared.startsWith(`5.2 常见误区\n\n${ZWSP}<text`), '高亮行应被遮挡');
 assert.ok(!prepared.includes('==典型错误做法=='), '原始 == 语法应被替换掉');
 
-console.log('inline-highlight: 行首高亮遮挡 / 代码块保护 / 端到端内容完整性 all pass');
+// --- 端到端：列表项内容以高亮开头时，后续文本与后续行都必须保留 ---
+const listReported = `第 14 课已经将人才需求编译为 \`TalentRequest\` 和 \`QueryPlan\`。
+
+当前系统能够执行硬条件筛选，但：
+- 语义要求仍是自然语言
+- 不同岗位关注的能力不同
+- ==评估维度==不能长期写死在代码中`;
+const listPrepared = prepareTextBlockContent(listReported, { highlightBackgroundColor: COLOR });
+assert.ok(
+	listPrepared.includes(`- ${ZWSP}<text background-color="${COLOR}">评估维度</text>不能长期写死在代码中`),
+	'列表项开头的高亮标签前应插入零宽空格'
+);
+assert.ok(listPrepared.includes('- 语义要求仍是自然语言'), '高亮列表项之前的内容必须完整保留');
+assert.ok(listPrepared.endsWith('不能长期写死在代码中'), '高亮后的同一行内容必须完整保留');
+
+console.log('inline-highlight: 行首/列表高亮遮挡 / 代码块保护 / 端到端内容完整性 all pass');
